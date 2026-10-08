@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MusicCam</string>
+    <string name="phase_zero_message">MusicCam · Phase 0\n\n项目基础已初始化。\n尚未接入相机或音频捕获。\n\n下一阶段验证系统允许捕获的播放音频。\n不同音乐 App 与内容的支持情况需要实测。</string>
+</resources>
