@@ -2,6 +2,82 @@
 
 更新时间：2026-10-09（Asia/Shanghai）。
 
+## Phase 2：CameraX 独立摄像头录像 PoC
+
+状态：Phase 2 八项核心验收已通过，本阶段实现完成；Debug 构建/Lint 与 vivo V2527A / Android 16 安装均成功。用户手动批准 CAMERA，后置取景画面已通过 ADB 截图观察。前后置两段约 10 秒视频及一段 Home 后停止的视频均定稿成功，独立检查为 H.264 / 1920×1080 / 单视频轨 / 零音轨，全帧解码通过。用户确认「前置后置录像正常」「home 返回，录像会被停止，但是正常保存」「音乐不会被打断，摄像并不会影响音乐」「音频实验正常」，并明确补充「两段均已播放，方向和时长正常」。新版 Phase 1 又取得非静音 WAV、完成 MediaPlayer 回放并释放服务。核心结果同时依据设备事件、独立文件检查和用户反馈；权限拒绝等异常路径及更多兼容性尚未逐项完成，不宣称全部设备行为通过。
+
+### 修改文件与本阶段范围
+
+- 新增 `app/src/main/java/dev/musiccam/prototype/CameraActivity.kt`：独立 CameraX PreviewView/Preview/VideoCapture<Recorder> 页面、CAMERA 用户授权、默认后置/前后切换、分开的开始/停止、定稿前防重复、前后台/销毁停止与解绑、录像异常展示、未确认定稿提示、MP4 播放入口。按屏幕高度限制控制区，横屏仍给预览留空间。
+- 新增 `app/src/main/java/dev/musiccam/prototype/Mp4Inspection.kt`：后台解析定稿输出，要求一个视频轨、零音轨、有效样本与正时长；显示实际 codec、宽高、旋转与帧率元数据，不把解析成功等同于用户观感确认。
+- `MainActivity.kt`：只添加独立录像页入口。`PlaybackCaptureService.kt`、`WavFile.kt`、`PocLog.kt` 无修改，原音频授权/服务/WAV/测试音/回放路径保留。诊断仍用既有日志，相机事件加 PHASE2 前缀。
+- `app/build.gradle.kts`：固定 CameraX 1.6.2 的 core/camera2/lifecycle/video/view 与 Activity 1.13.0。`gradle.properties`：启用 AndroidX，SDK 自动下载仍关闭；不改 Wrapper/AGP/Kotlin/SDK 版本。
+- `AndroidManifest.xml`：新增 CAMERA、可选 camera features、非导出 CameraActivity；移除 Media3 common 传递附带的 ACCESS_NETWORK_STATE。保留 AndroidX Core 的本应用 signature 动态接收器权限，无 INTERNET/存储权限、无相机前台服务或 microphone 服务。
+- `strings.xml`：新增相机页面入口与控件文案；`PROJECT.md`、`README.md`、`DECISIONS.md`：更新本阶段独立录像范围、测试步骤与 D011/D012 官方依据。
+
+录像不调用 withAudioEnabled，不采集麦克风，不读取 WAV、不合成系统音频，不创建相机 MediaProjection，不请求音频焦点或控制音乐音量。输出使用 MediaStore 公共视频集合 Movies/MusicCam，Android 29+ 写入本应用媒体不需要存储权限。默认 SDR；优先 FHD/目标 30fps，按能力和绑定结果尝试默认帧率、HD/SD。没有创建时间戳同步接口；后续外部 PCM 与公共时基另作 PoC。
+
+### 实际命令与构建结果
+
+所有命令在项目根目录，使用 `source .local/env.sh` 复用已有工具。只通过正常 Gradle 构建解析新增项目依赖，没有安装工具/SDK、接受新协议或改全局配置。证据与测试媒体仅存于忽略目录 `.local/phase2/`。
+
+| 验证 | 实际命令 / 结果 |
+| --- | --- |
+| 初始检查 | 已阅读 AGENTS/PROJECT/DECISIONS/STATUS、构建/Manifest 与全部现有 Kotlin 源码；`git status --short` 为空，基于既有 Phase 1 提交 3e087ed 工作，无覆盖用户改动 |
+| 工具 | `./gradlew --version` 成功；Gradle 9.7.1 / JDK 17，gradle-version.log |
+| 首次离线构建 | `./gradlew --offline --no-daemon :app:assembleDebug :app:lintDebug` 失败：CameraX 1.6.2 和部分 Activity 传递依赖没有缓存；不是源码/SDK 错误，build-offline-initial.log |
+| 正常依赖解析 | `./gradlew --no-daemon :app:assembleDebug :app:lintDebug`：BUILD SUCCESSFUL，3m55s，46 任务（28 执行 / 18 up-to-date），build-online.log；构建使用已有 API 36/Build Tools 36.0.0，未触发 SDK 安装 |
+| 移除传递权限后 | 同一离线命令成功，10s，build-offline-final.log |
+| 横屏布局调整后 | 同一离线命令成功，14s，build-offline-final2.log |
+| 最后简化画质状态后 | 同一离线命令成功，13s，46 任务（13 执行 / 33 up-to-date），build-offline-final3.log |
+| Lint | 0 errors / 15 warnings：SDK/Gradle 更新提示 3 个、UseKtx 3 个（含原音频服务）、SetTextI18n 9 个。未添加 suppression/baseline，未降低 targetSdk/关闭检查；本 PoC 暂为中文状态文案 |
+| 构建提示 | 既有 AGP/Gradle 弃用提示；CameraX 的两个 JNI 库未 strip，原样打包，未安装 NDK；不影响本次构建通过 |
+| APK | `apksigner verify` 成功；`aapt2 dump badging` 与合并 Manifest 确認 minSdk 29 / targetSdk 36，新 CAMERA 和既有四项权限、Core signature 权限；无网络/存储权限。apk-badging-final.txt |
+| 最终安装/冷启动 | `adb -d install -r app/build/outputs/apk/debug/app-debug.apk`：Success；`adb -d shell am start -W --user 0 -n dev.musiccam.prototype/.MainActivity`：Status ok / COLD / 308ms（Wait 313ms），install-final3.log / launch-final3.txt；覆盖安装保留原 WAV 与权限，不卸载 |
+| APK 标识 | Debug 0.0.1 / versionCode 1；SHA-256 d6d20ed10ea0492fc30f471b233b5624b739998ed9e6e5c2b77d80276b8e702f，apk-sha256.txt |
+| 诊断 | `adb -d logcat -d -b main -b system -b crash -v threadtime -s 'MusicCamPoC:V'` 与 `adb -d exec-out run-as dev.musiccam.prototype cat files/phase1-events.log` 均成功，logcat-app.txt / session-events.log。PHASE1 ERROR 探针明确是 intentional_probe_not_failure |
+| 代码检查 | `git diff --check` 已通过；原音频服务/WAV/日志文件 diff 为空。本阶段没有 Commit/Push/发布 |
+| 独立视频检查 | `adb -d pull /sdcard/Movies/MusicCam .local/phase2/videos`：3 文件，共 63,115,315 字节。逐文件执行 `ffprobe -v error -count_frames -show_streams -show_format -of json <本地文件>` 与 `ffmpeg -v error -xerror -i <本地文件> -map 0:v:0 -f null -`：均通过，零音轨、有效帧数和正时长；报告 video-inspection.json / 各文件 ffprobe.json、decode.log |
+| 本版音频文件 | `adb -d exec-out run-as dev.musiccam.prototype cat files/recordings/capture-1791481753827.wav > .local/phase2/recordings/capture-1791481753827.wav`；`python3 tools/inspect_wav.py <本地文件> --expect non-silent`：通过，wav-regression.json |
+| 停止后服务 | `adb -d shell dumpsys activity services dev.musiccam.prototype`：nothing，无活动捕获服务，services-after-tests.txt |
+
+### 设备观察与待完成验收
+
+`adb devices -l`：唯一 USB 已授权 device（序列号仅在本机）；本轮 `getprop` 重新核实 V2527A / Android 16 / API 36 / PD2527C_A_16.0.19.3.W10。MusicCam minSdk 29 / targetSdk 36。
+
+本轮重新用 `adb -d shell dumpsys package com.netease.cloudmusic` 读取到已安装网易云音乐 9.6.05 / versionCode 9006005 / targetSdk 33，与 Phase 1 一致；用户这次没有单独重述音乐 App 或内容，不能仅凭安装包信息确定本轮所有蓝牙音乐的具体音源。用户确认的本次蓝牙听感和测试音 AudioTrack 的 type=8（A2DP）分别记录，不记录耳机地址/序列号/私人曲名，不推广兼容性结论。
+
+| 验收项 | 本轮实际结果 |
+| --- | --- |
+| 摄像头授权/预览 | PHASE2_CAMERA_PERMISSION granted=true；用户手动授权，没有使用 ADB grant。后置真实画面已在截图中可见，CameraActivity 前台，绑定 FHD、目标 [30,30]；初版状态显示过长调试信息已修正为友好的 1080p/帧率说明 |
+| 后置录像 | 本版 FHD 录像开始、用户停止、Finalize error=0，10.543433 秒文件通过独立轨道与解码检查；用户确认后置录像正常 |
+| 前置预览/录像 | 本版切前置绑定 FHD / 目标 30fps，录像开始、用户停止、Finalize error=0；10.431200 秒文件通过独立轨道与解码检查，用户确认前置录像正常 |
+| MP4 播放/时长/方向 | 三段文件有有效时长与旋转矩阵，全帧解码通过；用户明确确认前后两段均已在手机播放，画面方向、约 10 秒时长正常 |
+| 无麦克风音轨 | 三段 MP4 均由手机 MediaExtractor 与主机 ffprobe 独立确认零 audio 轨；并非静音音轨，而是没有音轨 |
+| Home/锁屏/返回/重建 | 第三段记录 STOP_REQUEST reason=离开录像页面 → Finalize error=0，保存 1.299622 秒 MP4；其后恢复预览但无自动新录像事件。用户确认录像中按 Home 会停止并正常保存；锁屏/旋转/任务划除未逐项验收 |
+| Phase 1 回归 | 新授权 → mediaProjection FGS → 48000Hz/PCM16/2 声道 → 非静音 WAV → MediaPlayer STARTED/COMPLETED → 无活动服务；用户反馈音频实验正常。允许测试音播放/蓝牙 A2DP 路由日志存在；音源可能同时包含音乐，不宣称纯测试音频率基线 |
+| 蓝牙音乐连续性 | 针对蓝牙听歌时预览及前后录像的提问，用户确认「音乐不会被打断，摄像并不会影响音乐」。记录为本次蓝牙音乐未受摄像影响，不扩展到全部 App/路由；视频播放操作的音频焦点行为另计 |
+
+### 独立文件结果（仅本地媒体，不提交）
+
+| 文件 / 来源 | 时长 / 大小 | 视频 / 帧数 / 平均帧率 | 音轨与解码 |
+| --- | --- | --- | --- |
+| MusicCam-1791481650604-c2df5f7c.mp4 / 后置、用户停止 | 10.543433 秒 / 27,057,085 字节 | H.264，1920×1080，316 帧，约 29.97fps；旋转矩阵 -90°（ffprobe 约定） | 1 video / 0 audio，完整解码无报错 |
+| MusicCam-1791481667273-acea66b4.mp4 / 前置、用户停止 | 10.431200 秒 / 31,538,232 字节 | H.264，1920×1080，312 帧，约 29.91fps；旋转矩阵 +90° | 1 video / 0 audio，完整解码无报错 |
+| MusicCam-1791481686705-3c24bd7c.mp4 / 后置、离开页面 | 1.299622 秒 / 4,519,998 字节 | H.264，1920×1080，39 帧，约 30.01fps；旋转矩阵 -90° | 1 video / 0 audio，完整解码无报错 |
+
+手机容器检查分别报告 10.543 / 10.431 / 1.300 秒、video/avc、音轨 0。平均帧率接近目标 30，仍未分析帧间抖动、长时录制或降级机型；观看方向正常来自用户实际播放确认，旋转矩阵仅是补充文件证据。
+
+本版 capture-1791481753827.wav：20.309333 秒 / 3,899,436 字节（PCM 3,899,392），48000 Hz / PCM16 / 2 声道，974,848 帧；左右非零样本 807,865 / 809,817，峰值 30,911 / 29,449，RMS 3616.25 / 3425.42。RIFF/data 与实际数据一致，非静音预期通过。事件包含新的投影授权、允许测试音 ALL、type=8（蓝牙 A2DP）、用户停止、完整 WAV 回放 20,309ms；用户反馈音频实验正常。具体混合音源未单独确认。原 Phase 1 允许/拒绝基线结果保留，但本版拒绝策略对照未重新测试。
+
+### 已知问题与下一步
+
+1. 八项核心验收完成：真实预览、后置录像、前置录像、手机 MP4 播放、画面/时长/方向、零音轨、Phase 1 回归、蓝牙音乐未受摄像影响；Home 自动停止并正常保存也通过。异常路径、长时录制和其他音源/路由仍需独立验证。
+2. 默认码率/codec 与实际帧率由 CameraX/设备决定；30fps 请求、AE 范围与元数据均不能保证每帧均匀间隔。降级路径、相机占用/隐私开关、永久拒绝/撤权、磁盘满和强杀仍需单独设备测试。
+3. 录像仅限可见 Activity；离开即停，没有后台相机服务。进程强杀不能保证 Finalize 或定稿，未确认会话显示警告；不自动恢复或当作成功。异常可解析的部分 MP4 保留并显示错误码。
+4. 下一阶段建议先补关键权限/异常与长时录像，再验证视频编码输入、播放 PCM 编码及公共时基；先验证同步可行性，再确定 MediaCodec/MediaMuxer 或其他公开 API 组合。本阶段不假设 Recorder 可直接接收外部 PCM，不复用现有 WAV 来模拟实时同步。
+5. 真机录像/截图可能包含私人场景，均只保存在 `.local/phase2/`，不进入 Git。未自行提交、推送或发布。
+
 ## Phase 1：系统音频捕获 PoC
 
 状态：最小播放捕获、授权、前台服务、WAV 保存与回放已实现；Debug 构建、Lint、安装、启动和应用 Logcat 已通过。vivo 真机上的网易云日推歌曲经蓝牙耳机播放，用户确认 WAV 回放有声，独立文件检查确认非静音 PCM。自有测试音首版状态检查有误，已修复；修正版允许/拒绝音源对照均通过文件检测和用户回放确认，音频捕获核心 PoC 已通过。锁屏/解锁实测继续录音，回放正常；本机纯音频锁屏没有触发撤权回调。系统主动撤权及其他异常路径仍待用户实测，尚不能宣称全部通过。

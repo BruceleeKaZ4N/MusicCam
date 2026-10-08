@@ -57,6 +57,9 @@ class MainActivity : Activity() {
             setPadding(spacing, spacing, spacing, spacing)
         }
         content.addView(TextView(this).apply { setText(R.string.phase_one_intro); textSize = 18f })
+        button(content, R.string.open_camera) {
+            startActivity(Intent(this, CameraActivity::class.java))
+        }
         startButton = button(content, R.string.start_recording) { begin() }
         stopButton = button(content, R.string.stop_recording) {
             PlaybackCaptureService.stop("用户停止")

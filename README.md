@@ -1,6 +1,6 @@
 # MusicCam
 
-Android 播放音频与真实相机视频同步录制的实验项目。当前为 Phase 1：最小系统播放音频捕获 PoC，可开始/停止、保存 PCM16 WAV 并回放；不采集麦克风或相机。只支持系统与播放方允许捕获的音频，实际验证结果见 STATUS.md。
+Android 播放音频与真实相机视频同步录制的实验项目。当前 Phase 2 提供独立 CameraX 预览与无音轨 MP4 录像；保留 Phase 1 系统播放音频捕获、PCM16 WAV 保存和回放。暂不合成音视频，不采集麦克风。只支持系统与播放方允许捕获的音频，实际验证结果见 STATUS.md。
 
 产品边界见 [PROJECT.md](PROJECT.md)，架构理由见 [DECISIONS.md](DECISIONS.md)，实际验证进度见 [STATUS.md](STATUS.md)，工程协作规则见 [AGENTS.md](AGENTS.md)。项目尚未确定开源许可证。
 
@@ -23,6 +23,8 @@ MusicCam/
 ```
 
 `MainActivity` 提供授权入口、测试音和 WAV 回放；`PlaybackCaptureService` 管理捕获会话，`WavFile` 写入 WAV，`PocLog` 输出诊断事件。`tools/inspect_wav.py` 使用 Python 标准库独立检查文件，无新增 Android 依赖。
+
+`CameraActivity` 独立管理 CameraX 预览、摄像头切换、无音轨录像和生命周期；`Mp4Inspection` 在定稿后检查视频样本、时长和音轨数量。相机页采用 ComponentActivity 与平台 Views，不改变 Phase 1 Activity/服务。CameraX 1.6.2、Activity 1.13.0 固定为正式稳定版本，AndroidX 开启；传递依赖由 Gradle 正常解析。
 
 ## 构建
 
@@ -81,3 +83,22 @@ python3 tools/inspect_wav.py .local/phase1/recordings/<文件名>.wav --expect n
 ```
 
 `-d` 只适用于唯一已连接 USB 设备。拒绝捕获对照检查用 `--expect silent`；存在其他可捕获音源时不能期待全静音。检测结果只说明文件参数与数据，不自动证明音源正确或播放听感正常。录音、截图和本机证据保留在 `.local/`，不得提交私人媒体。
+
+## Phase 2 手机测试
+
+1. 从原音频页点击「独立摄像头录像（无音轨）」，再点击「授权摄像头 / 重试预览」，手动允许 CAMERA。首次默认后置，重建保留当前镜头；拒绝不会开始录像，永久拒绝需手动前往应用设置授权。
+2. 确认实时预览，在非私人场景录制约 10 秒，点击停止，等待文件检查完成。开始/停止分开；录像与定稿期间不能切镜头或再次开始。
+3. 切换前置，再录制约 10 秒。输出位于相册/文件管理器可访问的 `Movies/MusicCam`，不申请存储权限；「打开最近的 MP4」显式调用系统播放器，播放操作可能改变音乐播放，需与摄像头录制阶段区分。
+4. 检查前后画面、方向、时长及播放；应用容器检查应显示「视频轨 1 · 音轨 0」。帧率请求优先 30fps；分辨率依次 FHD/HD/SD，绑定失败时尝试设备默认帧率和低分辨率。请求值与文件元数据不等于实测每帧均为 30fps。
+5. 录像中 Home/锁屏/返回/旋转页面应停止并定稿；回到页面只恢复预览，需手动再开始。后台不采集相机、不启动相机前台服务。强杀无法保证定稿，未完成标记不能当作成功。
+6. 返回原音频页，重新授权播放捕获，用允许测试音录制 WAV 并回放，再用拒绝对照音建立对照，检查 Phase 1 回归。
+7. 在蓝牙耳机播放音乐时分别打开预览、后置录像和前置录像，确认有没有暂停、中断或音量变化。应用录像不启用 CameraX audio、不请求音频焦点、不控制其他播放器；厂商/音乐 App 行为必须实测。
+
+真机媒体与截图只存于忽略目录 `.local/phase2/`。应用事件仍共用私有 `phase1-events.log`，相机事件加 `PHASE2_` 前缀。若已有 ffprobe/ffmpeg，可独立检查拉取的 MP4（无需新工具）：
+
+```sh
+ffprobe -v error -show_streams -show_format -of json .local/phase2/videos/<文件名>.mp4
+ffmpeg -v error -i .local/phase2/videos/<文件名>.mp4 -map 0:v:0 -f null -
+```
+
+应为单一 video 轨、零 audio 轨；解码成功不能代替用户确认取景内容和蓝牙听感。

@@ -1,6 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">MusicCam</string>
+    <string name="open_camera">独立摄像头录像（无音轨）</string>
+    <string name="camera_intro">MusicCam · 摄像头录像 PoC\n优先 1080p / 30fps，按设备能力降级。无麦克风或系统音轨。离开此页面会停止并保存。</string>
+    <string name="camera_permission">授权摄像头 / 重试预览</string>
+    <string name="camera_start">开始录像</string>
+    <string name="camera_stop">停止录像</string>
+    <string name="camera_switch">切换前后摄像头</string>
+    <string name="camera_open_video">打开最近的 MP4</string>
+    <string name="camera_back">返回系统音频实验</string>
     <string name="phase_one_intro">MusicCam · 系统音频捕获 PoC\n只捕获系统与播放方允许的播放音频，不采集麦克风或屏幕画面。系统仍会显示投影授权界面。\nWAV 保存在应用私有目录；卸载会移除文件。</string>
     <string name="start_recording">开始录音</string>
     <string name="stop_recording">停止录音</string>

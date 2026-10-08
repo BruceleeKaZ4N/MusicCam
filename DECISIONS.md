@@ -2,6 +2,32 @@
 
 记录日期：2026-10-08。构建可行性与设备可行性分开验收；尚未实测的方案保持待验证。
 
+## D011：Phase 2 独立 CameraX 录像页，音频模块保持原样
+
+查阅日期：2026-10-09；适用 minSdk 29 / compileSdk、targetSdk 36。
+
+采用 CameraX 正式稳定版 1.6.2 的 PreviewView、Preview、VideoCapture<Recorder>、ProcessCameraProvider；另用稳定 Activity 1.13.0 的 ComponentActivity 提供 LifecycleOwner 和摄像头权限结果处理。只添加 camera-core、camera-camera2、camera-lifecycle、camera-video、camera-view 和 activity 直接依赖，不增加 Compose/AppCompat/播放器框架。CameraX 1.6 的 CameraPipe/Media3 为库自身传递实现；项目不另建编码/合成流水线。
+
+实际合并 Manifest 检查发现 Media3 common 1.9.0 传递声明 ACCESS_NETWORK_STATE；本阶段只使用本地封装，不需要网络监测，以 tools:node=remove 移除此无关权限。保留 AndroidX Core 为非导出动态接收器添加的本应用 signature 权限（DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION），它不是用户运行时授权或网络访问能力。没有 INTERNET 或存储权限。
+
+新增独立 CameraActivity；MainActivity 只添加页面入口，PlaybackCaptureService、WavFile、PocLog 不改。默认后置，停止且定稿完成后才能切前后镜头。绑定 Preview + VideoCapture 到 Activity 生命周期，onPause 显式请求停止，onDestroy 解绑自己的 use cases；Home、锁屏、返回、配置重建不会持续后台录像，返回页面不自动开始新录像。前台录像保持屏幕亮，退出即清除。相机错误、权限拒绝/撤回、启动/定稿异常明确展示，不把失败文件标为成功；进程终止无法保证最终回调，保留未确认会话提示。
+
+依据：[CameraX 稳定版本](https://developer.android.com/jetpack/androidx/releases/camera)、[Activity 稳定版本](https://developer.android.com/jetpack/androidx/releases/activity)、[生命周期绑定](https://developer.android.com/media/camera/camerax/architecture)、[摄像头权限](https://developer.android.com/training/permissions/requesting)。原 D004 的最少依赖选择仅适用于早期音频页面，本阶段单独引入相机所需的生命周期能力。
+
+## D012：优先 FHD/30fps、SDR，输出无音轨 MediaStore MP4
+
+查阅日期：2026-10-09；适用 minSdk 29 / targetSdk 36，CameraX 1.6.2。
+
+每个镜头独立查询 Recorder 视频能力，依次尝试 FHD（1080p）/HD（720p）/SD，必要时采用唯一可用质量。查询 CameraInfo AE 帧率范围，优先请求 [30,30]；不支持时选接近 30 的设备范围。用例组合绑定失败先尝试默认帧率，再降画质。AE 范围对特定用例组合并非保证，帧率是目标而非实际每帧承诺；分辨率、旋转、轨道、时长与帧率元数据通过定稿后 MediaExtractor/MediaMetadataRetriever 检查，另外用主机 ffprobe/ffmpeg 和用户回放验收。采用 SDR 与 Recorder 默认编码器，具体 codec 由实际文件报告，不预设设备必定返回 H.264。
+
+通过 MediaStoreOutputOptions 写入公共视频集合，MIME video/mp4，RELATIVE_PATH=Movies/MusicCam；API 29+ 写入本应用拥有的媒体无需存储权限。Recorder 负责创建和定稿容器；仅收到 Finalize 后才检查并提供播放入口。发生 CameraX 错误但部分文件可解析时明确显示部分视频与错误码；无法解析时保留输出诊断，不宣称成功。强杀/磁盘满等边界另作设备测试。
+
+摄像头页只申请 CAMERA，从不调用 withAudioEnabled，不创建 AudioRecord/MediaProjection、不请求音频焦点或修改音量/音乐播放器。现有 RECORD_AUDIO 仅继续供 Phase 1 使用，即使已获此权限，录像仍不启用音轨；容器检查要求 audio 轨为零。打开播放器是用户显式操作，其音频焦点影响与录像本身分开测试。蓝牙音乐连续性只有设备听感可确认。
+
+本阶段 Recorder 管理自身视频时间戳；没有合成、同步、外部 PCM 注入、读取 WAV 或创建空同步接口。后续需独立验证相机编码输入、播放 PCM 编码与公共时基，不能由这个 Recorder 原型直接推断合成可行。
+
+依据：[视频捕获架构与音频选择](https://developer.android.com/media/camera/camerax/video-capture)、[VideoCapture.Builder](https://developer.android.com/reference/androidx/camera/video/VideoCapture.Builder)、[帧率范围和组合限制](https://developer.android.com/reference/androidx/camera/core/CameraInfo#getSupportedFrameRateRanges())、[Finalize 错误与输出](https://developer.android.com/reference/androidx/camera/video/VideoRecordEvent.Finalize)、[本应用媒体权限](https://developer.android.com/training/data-storage/shared/media#access-own-files)、[MediaExtractor](https://developer.android.com/reference/android/media/MediaExtractor)。文档预期与本次构建/设备结果分别见 STATUS.md。
+
 ## D001：先做音频可行性实验
 
 采用单模块 `app`，Phase 0 只提供最小启动页和构建入口。下一阶段先用可控音源验证播放捕获，再测试第三方 App，最后引入相机。
