@@ -9,7 +9,7 @@ MusicCam 是一个计划在 GitHub 开源的 Android 相机应用。目标是让
 ## 验证环境
 
 - 开发机：用户提供 macOS / Apple Silicon M4；本机检查为 arm64 / macOS 27.0.1。
-- 目标真机：用户提供 vivo S50 Pro mini，Android 16 / OriginOS 6；尚未通过 ADB 核实。
+- 目标真机：用户提供 vivo S50 Pro mini；ADB 已核实 vivo V2527A，Android 16 / API 36。OriginOS 6 为用户描述，系统属性见 STATUS.md。
 - 最低 Android 版本：Android 10 / API 29，因为 AudioPlaybackCapture 从此版本提供。
 - 初始 compileSdk / targetSdk：36，验证 Android 16 的现行系统行为。
 
@@ -22,7 +22,7 @@ MusicCam 是一个计划在 GitHub 开源的 Android 相机应用。目标是让
 | Phase 2 | 接入真实相机画面，研究独立音轨与视频时间戳 | 实际画面、音频来源、输出轨道和长时间同步误差 |
 | Phase 3 | 编码封装、恢复路径、产品 UI 和开源准备 | 真机回归、兼容性记录、许可证与发布资料 |
 
-Phase 0 只有启动说明页，不实现捕获授权、AudioRecord、前台服务、CameraX、MediaCodec 或 MediaMuxer，也不申请相关权限。不引入互联网、相机、麦克风或存储权限。后续按实际功能逐步添加。
+Phase 0 只有启动说明页。当前 Phase 1 已实现 MediaProjection 授权、AudioPlaybackCapture / AudioRecord、mediaProjection 前台服务、WAV 保存与回放，以及自有测试音源；实际验收结果见 STATUS.md。只加入播放捕获所需的 RECORD_AUDIO、前台服务权限和通知权限，不采集麦克风，不引入互联网、相机、存储权限、CameraX、MediaCodec 或 MediaMuxer。
 
 ## 已确认的技术限制
 

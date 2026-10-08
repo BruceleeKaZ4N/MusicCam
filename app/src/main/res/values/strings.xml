@@ -1,5 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">MusicCam</string>
-    <string name="phase_zero_message">MusicCam · Phase 0\n\n项目基础已初始化。\n尚未接入相机或音频捕获。\n\n下一阶段验证系统允许捕获的播放音频。\n不同音乐 App 与内容的支持情况需要实测。</string>
+    <string name="phase_one_intro">MusicCam · 系统音频捕获 PoC\n只捕获系统与播放方允许的播放音频，不采集麦克风或屏幕画面。系统仍会显示投影授权界面。\nWAV 保存在应用私有目录；卸载会移除文件。</string>
+    <string name="start_recording">开始录音</string>
+    <string name="stop_recording">停止录音</string>
+    <string name="baseline_instructions">可控音源：先开始录音并完成授权，再播放允许捕获的测试音 10 秒，停止录音后停止测试音并回放。请手动调整媒体音量。\n拒绝捕获对照请另开一次会话，且只播放对照音。</string>
+    <string name="play_allowed_tone">播放允许捕获的测试音</string>
+    <string name="play_denied_tone">播放拒绝捕获的对照音</string>
+    <string name="stop_playback">停止测试音 / 回放</string>
+    <string name="replay_wav">回放最近的 WAV</string>
+    <string name="exit_app">停止录音并退出</string>
+    <string name="source_idle">测试音 / 回放已停止</string>
+    <string name="allowed_tone_playing">正在播放允许捕获的测试音：左声道 440 Hz，右声道 880 Hz。</string>
+    <string name="denied_tone_playing">正在播放拒绝捕获的对照音：ALLOW_CAPTURE_BY_NONE。不得将其静音结果视为录音失败。</string>
+    <string name="wav_playing">正在回放 WAV，请确认能听到刚才的音源。</string>
+    <string name="waiting_audio_permission">等待音频权限。系统称为“麦克风”权限，本应用只使用播放捕获配置。</string>
+    <string name="audio_permission_denied">未获得 RECORD_AUDIO 权限；未开始录制。可再次点击开始，永久拒绝时请在应用设置中手动授权。</string>
+    <string name="waiting_projection">等待本次 MediaProjection 系统授权…</string>
+    <string name="projection_denied">已取消或拒绝投影授权；未开始录制。</string>
+    <string name="starting_service">正在启动录音前台服务…</string>
+    <string name="incomplete_file_warning">存在未定稿的 .part 文件（可能发生进程终止或保存失败），不能将其视为完成的 WAV。</string>
+    <string name="capture_channel">系统音频捕获</string>
+    <string name="capture_notification_title">MusicCam 正在捕获系统播放音频</string>
+    <string name="capture_notification_text">仅录制允许捕获的音频；点击停止可保存 WAV。</string>
 </resources>
