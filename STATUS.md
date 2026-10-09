@@ -2,6 +2,77 @@
 
 更新时间：2026-10-09（Asia/Shanghai）。
 
+## Phase 3：系统音频与摄像头录后自动合成 PoC（最小原型完成，同步有局限）
+
+已实现最小原型；自动构建、实际前后置合成/回放、发布成功/失败清理对照与独立功能回归已通过。镜面测试可见区间得到局部音频滞后约 100ms 的估计，但开头未完整入镜，重复脉冲不能排除整周期配对歧义，绝对同步仍未验证。用户明确「正常，不用再过度检测测了」，本阶段按现有证据收尾，不追加录制或边界测试，不把局部估计写成精准同步通过。基于既有 Phase 2 提交 e45da32 开始，初始 Git 状态干净；无自动 Commit/Push。
+
+### 已完成实现与修改文件
+
+- 新增 CombinedSessionController.kt：统一 UUID 会话状态、两路启动/停止/异常协调、启动/定稿等待、工作线程合成、失败备份/重试；使用应用 Context，页面退出停止采集，定稿合成继续完成。
+- 新增 AudioCaptureTiming.kt、AudioAlignment.kt：BOOTTIME 时间记录、AudioRecord framePosition/nanoTime 锚点、起点和离散度；按实际起点差裁剪或补静音，首份零值 PCM 与首次非零样本分开。
+- 新增 AudioVideoComposer.kt：原生 MediaCodec AAC-LC 192kbps/48kHz/立体声，MediaExtractor 无损读取 H.264，MediaMuxer 双轨 MP4，保存方向、源 PTS 间隔与视频范围；失败保留原始数据，无 FFmpeg Android 依赖。
+- 新增 SessionStorage.kt：私有会话目录、AtomicFile JSON、MediaStore pending 发布与输出检查、安全清理。成功后只清理本轮媒体，JSON 留存；失败不删除原始视频/WAV/.part。
+- 修改 CameraActivity.kt/MainActivity.kt/strings.xml：合成入口、一次开始/停止、每轮人工投影授权、重试、声光测试；保留原独立摄像头和音频页面。PlaybackCaptureService.kt 只添加可选 sessionId、时间采样与状态/停止协调，既有独立 PCM/WAV 流程和回放偏好保留。Mp4Inspection.kt 保留零音轨默认检查，增加单 AAC 检查。
+- 新增 SyncProbe.kt、tools/measure_sync.py：物理镜面色块 + 1kHz 脉冲及主机事件分析。新增 src/debug 框架 Instrumentation 与 tools/check_native_composer.py：只测试合成文件、无新库、不请求采集授权，不在 Release 暴露测试组件。
+- PROJECT/README/DECISIONS（D013–D016）更新范围、操作和官方依据；.gitignore 忽略 Python 缓存。Manifest/main 和 Gradle 依赖、min/targetSdk、SDK 版本不变；没有全局工具安装。
+
+### 自动化实际结果
+
+环境复用 source .local/env.sh。证据仅在忽略目录 .local/phase3；媒体、设备序列号和授权内容不提交。
+
+| 验证 | 实际命令/结果 |
+| --- | --- |
+| 核心构建 | ./gradlew --offline --no-daemon :app:assembleDebug :app:lintDebug：首次核心 BUILD SUCCESSFUL，18s，build-initial.log |
+| UI 首版 | 同一命令 Lint 失败：CameraActivity 条件分支缩进 SuspiciousIndentation；已加明确括号。新 API encoder delay/padding 访问补 API30 检查，没有关闭检查，build-ui.log |
+| 修正版 | build-ready.log 16s、build-native-runner.log 15s、build-final-prototype.log 17s 均 BUILD SUCCESSFUL；build-review.log 16s、build-final.log 15s 均成功；最终 Lint 0 errors / 19 warnings（版本提示、UseKtx、中文状态文案），无 suppression/baseline。早先最新 APK 安装被手机拒绝；用户再次要求推送后 adb -d install -r 成功，当前已安装最新 Debug APK |
+| 首次安装 | adb -d install -r <Debug APK>：INSTALL_FAILED_ABORTED/User rejected permissions；用户说明误操作后重新推送，Success，没有绕过手机确认 |
+| 原生 Shell 尝试 | Debug APK 推到 /data/local/tmp 后 app_process 执行合成测试被设备终止（137/Killed）；没有编码结果，不把它判成测试通过。改用公开 Instrumentation，公开 Instrumentation 已执行 4 组编码/封装测试及 1 组发布/检查失败清理测试，全部通过 |
+| 真实首轮合成 | CameraX 与 AudioRecord 均启动、用户停止、两路定稿，PHASE3_COMPOSITION_DONE；发布 H.264 + AAC MP4，并清理本轮所有中间媒体，只剩 session/audio-timing/composition JSON |
+| 首轮独立检查 | adb -d pull <最终MP4>；ffprobe -v error -show_streams -show_format -of json；ffmpeg -v error -xerror -i <文件> -map 0:v:0 -map 0:a:0 -f null -：通过，双轨完整解码，报告 first-mp4-inspection.json / first-decode.log |
+| 前置镜面文件 | 同样独立拉取、ffprobe 与双轨完整解码通过，mirror-test/decode.log；会话有 sync-probe.json，14 次绿色/暗色周期，记录路由 type=8（Bluetooth A2DP） |
+| 第一轮实际同步测量未通过 | python3 tools/measure_sync.py <前置MP4> --output <sync-default.json>；另加 --roi 0.73,0.46,0.23,0.22 重测：均返回 No clear green-flash contrast。镜中屏幕较小且过曝，无法可靠区分色块起点；没有可报告的实际偏移。报告 mirror-test/sync-default.json / sync-screen.json，未调低阈值凑通过 |
+| 第二轮镜面测量 | 4e6f7369 会话整段默认/屏幕 ROI 对比检测失败；只裁取前 21s 后检测因脉冲计数不等失败（开头/末尾没有屏幕，部分周期移动遮挡）。最终直接对原始 MP4 使用 --roi 0.35,0.45,0.6,0.35 --interval 9,17：8 对脉冲、4 对稳定样本，局部中位 +101.178ms，范围 +96.689～+105.667ms；sync-visible-original.json。数量/对比判据未修改，绝对周期身份未验证，不宣称完整同步通过 |
+| 分析区间验证 | 修改主机工具增加原始 PTS 区间筛选后，用已有 known-aligned.mp4 --interval 1,7：6 对脉冲、3 对稳定样本均 0ms，host-probe-check/interval-check.json；Python 编译和 git diff --check 通过。只改主机分析/文档，Android APK 未变，不重复安装/构建 |
+| 最终版独立功能回归 | adb 读取 capture-1791548845587.wav，tools/inspect_wav.py --expect non-silent：13.12s、48kHz/PCM16/2 声道、非零 1,011,225 样本，通过；随后 policy=NONE 的 capture-1791548868839.wav 为 8.213s 全静音，--expect silent 通过。最初把最新 NONE 文件用于 non-silent 检查返回 expectation_met=false，核对事件策略后区分允许/拒绝对照，没有把静音当成功捕获 |
+| 最终版独立视频回归 | 拉取 MusicCam-1791549188558-833dfdc7.mp4（后置）/MusicCam-1791549191570-5bfd0cab.mp4（前置），ffprobe 单 H.264/零 audio，双文件完整解码通过；实际 27 帧/0.899733s、19 帧/0.635233s，比请求的 5 秒短，只证明本轮短录像回归。regression/rear.json / front.json / 各 decode.log，停止后服务 nothing |
+| 分析器基线 | 用现有主机工具生成已知对齐的 8s 合成声光文件；tools/measure_sync.py 测到 8 对脉冲、5 对稳定样本、0ms 偏移，host-probe-check/sync-report.json；这是分析器基线，不是真机采集同步结果 |
+| 原生对照 | python3 tools/check_native_composer.py：aligned / audio_early / audio_late / invalid_timing 四组在 API36 实际 MediaCodec/Extractor/Muxer 通过；源视频/WAV 哈希不变，主机视频帧哈希、PTS（误差 0us）、方向、时长、双轨解码通过，native-checks-run2.log / native-checks-final.log。最新版另跑 native-checks-publication.log：五组通过；发布失败自动删除本轮 pending 媒体项、保留源文件，正常发布/检查通过，并删除仅本测试刚创建的合成媒体（不删除用户视频） |
+| 对照首轮未通过 | 主机 audio_early 旋转断言失败：测试视频用旧 rotate tag 未实际带旋转矩阵；输入 ffprobe 也报告无旋转。修正为现有 ffmpeg display_rotation 输入选项并先校验源矩阵，重跑后通过，native-checks-run.log 保留 |
+| 对齐算法 | 主机现有 JDK 与项目编译类运行 AudioAlignmentCheck：500 组独立逐帧映射（提前/滞后/无交集/尾部不足）通过，并拒绝空 PCM；alignment-check.log |
+| 最终 APK 检查 | apksigner verify 通过；aapt2 dump badging 确认 min29 / target36、既有权限不变。SHA-256 见 apk-sha256-final.txt；用户再次要求推送后手机确认安装成功，MainActivity 冷启动 Status ok / 205ms，停止后捕获服务为 nothing |
+| 静态检查 | git diff --check 通过，Python 脚本可编译；无新依赖/SDK 安装 |
+
+真实首轮会话 40eaa719-9f98-41e3-85be-cada4925f584：Movies/MusicCam/MusicCam-AV-40eaa719-9f98-41e3-85be-cada4925f584.mp4，41,086,216 字节；视频 H.264 / 1920×1080 / 442 帧 / 14.755478s / 旋转 -90°（ffprobe）；AAC-LC / 48000Hz / 2 声道 / 692 包 / 14.755500s。两轨起点均为 0，完整解码通过；时长相近不能证明同步。
+
+原 PCM 724,992 帧 / 15.104s / 1,441,612 个非零样本。audioOriginEstimateNs=487482392010416，videoOriginEstimateNs=487482903420407，相差约 511.410ms；裁剪开头 24,548 帧、尾部补 7,820 帧（约 162.917ms），不是根据总时长配平。15 个 AudioTimestamp 锚点起点离散约 64.068ms，视频候选离散约 107.642ms；包含初始化与管线延迟，不是精度/误差上界。实际 AAC 编码器 c2.android.aac.encoder 首 PTS=0，未报告 encoder delay/padding；未应用固定 priming 补偿。
+
+前置镜面会话 324a02e3-22f1-4022-b911-275d7fa146c3：最终 MP4 62,233,665 字节；H.264 / 1920×1080 / 624 帧 / 20.895800s / 旋转 +90°（ffprobe，Android 270°）；单 AAC-LC / 48000Hz / 2 声道 / 980 包 / 20.895792s，双轨从 0 开始且完整解码通过。原 PCM 1,011,712 帧 / 21.08s，按观测起点差 390.651ms 裁剪开头 18,751 帧、尾部补 10,038 帧；这仍只是近似对齐计算，不是实际同步测量。成功后中间媒体已清理，四份会话/时间/合成/声光 JSON 留存。
+
+声光播放约 13.713s，14 次绿色事件均记录蓝牙 A2DP。测试音开始前及停止后的解码音频仍有持续声音（0.5–1.5s RMS 2268.91、19–20s RMS 3042.5；mirror-test/partial-analysis.json）；不能视为纯测试音基线，也不能据此推断麦克风输入。该文件测量失败不影响其轨道与解码通过结论，主观正常播放不能替代同步偏移验收。
+
+第二轮前置镜面会话 4e6f7369-5dd8-4aab-bdcf-d4fe6b2798cc：106,067,237 字节，单 H.264 1920×1080 / 1008 帧 / 33.734100s / +90°，单 AAC-LC 48kHz/2 声道 / 1582 包 / 33.734104s；完整双轨解码通过，中间媒体已清理。stopReason=离开录像页面，两路均定稿且自动合成完成，说明实际离开页停止/保存路径通过；不能推断具体按的是 Home。SyncProbe 约 16.443s、17 次亮/暗周期、蓝牙 type=8；原 PCM 1,631,232 帧，其中非零 312,064 样本，与间歇测试音相符。
+
+可见区间直接用原始文件 9–17s PTS 分析，没有以转码/裁取副本作为最终证据。8 对脉冲中，稳定统计取第一个可见脉冲后至少 2s、区间末尾至少 1s 的 4 对：中位声音晚于绿色 +101.178ms，范围 +96.689～+105.667ms，首末变化 -8.978ms。量化约视频 33.433ms + 音频窗口 10ms，短时变化不能解释成长时漂移。整段首尾色块缺失，每秒重复脉冲没有唯一编号，结果有整周期歧义，是包含播放头/显示/蓝牙/捕获/AAC 的局部估计，未证明绝对音画偏移；未据此硬编码补偿。所有实际失败与原始 PTS 分析报告保留在 mirror-test-2。
+
+### 人工实际结果与尚未验证
+
+目标仍为 vivo V2527A / Android 16 / API36，此前核实系统 PD2527C_A_16.0.19.3.W10；本轮 USB device 与无活动旧音频服务已核实。用户本轮明确音源为网易云歌曲、蓝牙耳机；此前包版本为 9.6.05/9006005，本轮重新核实仍为 9.6.05/9006005/targetSdk33；具体曲目与耳机地址不登记、不推定所有内容兼容。
+
+- 人工通过：针对取消投影、重新授权、后置录制、自动合成、画面/方向/时长/音乐回放及蓝牙连续性的测试提问，用户回复「可以测试完全正常，用的蓝牙耳机听的网易云上面的歌，没问题」。事件也显示 PHASE3_PROJECTION_DENIED no_capture=true，之后新一次请求/授权才启动服务和录像。
+- 人工通过：前置镜面合成片段，针对手机回放、画面方向/时长/测试音及音乐是否暂停的追问，用户回复「正常啊，音乐没被打断。」记录为前置主观回放正常及蓝牙音乐未中断；不据此认定音源已暂停或音画偏移合格。
+- 人工通过：第二轮明确要求暂停网易云、蓝牙声光测试和手机回放，用户回复「完成了，正常」。针对独立音频与无音轨录像回归回复「正常，不用再过度检测测了」。独立回放主观正常与自动文件结果分别记录；蓝牙路由另有事件依据。
+- 收尾：第一轮无有效色块、第二轮整段计数失败及局部区间估计已如实记录。USB 曾只读检查 no devices found，用户完成测试后重新连接 device，已读取本轮文件。安装确认此前被拒绝后已正常重新安装最新 APK，未自动操作确认；没有再安装或打断人工录像。
+- 未验证：绝对同步（局部相位估计有整周期歧义）、Home 的具体手势（离开页面双轨定稿已实际观察）、RECORD_AUDIO/CAMERA 拒绝/永久拒绝、系统主动撤权、强杀、磁盘满、实际 provider 故障（合成测试的检查失败清理已通过）、多个失败会话、长时漂移与其他路由/App。
+- 原 Phase 1/2 的人工通过保留为历史结果，不能冒充当前新增合成版本的回归结果。
+
+### 已知局限与下一步
+
+1. 高层 Recorder 没有公开绝对采集首帧时刻；Status 起点是包含编码/事件交付延迟的近似。AudioTimestamp 也是系统最佳估计。不能宣布精准同步，声光测试会单独报告方法、偏移、范围和测量分辨率。
+2. 保留真实开头静音；音频不足补零会显示全静音警告，但非静音也不自动证明内容/同步正确。native 合成文件的三组已知 PCM 脉冲分别在输入 0.500/0.250/0.750s 之后解码到 0.540/0.290/0.790s（5ms RMS 窗口），观测约 +40ms 起音延迟。8s 声光合成文件另测 8 对脉冲、5 对稳定样本均约 +40ms、短时漂移 0ms，native-checks/synthetic-sync-report.json；这仅测编码/合成环节，不是 CameraX 与系统音频的实际总偏移。没有据此硬编码同步补偿；未报告 AAC priming 与长时漂移仍是局限。
+3. 仅接受本设备已观察的 H.264 递增 PTS；HEVC/B 帧/加密来源明确失败并保留数据，不声称多机型支持。
+4. 强杀无法保证 WAV/MP4 定稿；未完成数据原样保留，重试需要完整来源/时间记录。私有数据卸载会丢失；失败的可解析视频尽可能另行公开备份。
+5. 下一阶段优先给声光事件增加唯一启动标记/非周期编码以消除整周期歧义，再确认采集时基和 AAC priming；之后按需测长时漂移、路由切换和异常释放。本次用户要求停止追加测试，现有局限保留，不扩展产品 UI。未提交或推送 Git。
+
 ## Phase 2：CameraX 独立摄像头录像 PoC
 
 状态：Phase 2 八项核心验收已通过，本阶段实现完成；Debug 构建/Lint 与 vivo V2527A / Android 16 安装均成功。用户手动批准 CAMERA，后置取景画面已通过 ADB 截图观察。前后置两段约 10 秒视频及一段 Home 后停止的视频均定稿成功，独立检查为 H.264 / 1920×1080 / 单视频轨 / 零音轨，全帧解码通过。用户确认「前置后置录像正常」「home 返回，录像会被停止，但是正常保存」「音乐不会被打断，摄像并不会影响音乐」「音频实验正常」，并明确补充「两段均已播放，方向和时长正常」。新版 Phase 1 又取得非静音 WAV、完成 MediaPlayer 回放并释放服务。核心结果同时依据设备事件、独立文件检查和用户反馈；权限拒绝等异常路径及更多兼容性尚未逐项完成，不宣称全部设备行为通过。

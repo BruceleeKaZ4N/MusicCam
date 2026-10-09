@@ -2,6 +2,58 @@
 
 记录日期：2026-10-08。构建可行性与设备可行性分开验收；尚未实测的方案保持待验证。
 
+## D013：统一录制会话，保留两路成熟采集实现
+
+查阅日期：2026-10-09；适用 minSdk 29 / compileSdk、targetSdk 36，CameraX 1.6.2。
+
+合成入口复用 CameraActivity 的预览与 Recorder，视频仍禁用 withAudioEnabled。CombinedSessionController 持有应用级 Context，协调 PREPARING → RECORDING → STOPPING → MERGING → DONE/FAILED，不持有 Activity；页面只订阅状态，销毁时解绑。单次开始先取得 CAMERA/RECORD_AUDIO 和本轮显式 MediaProjection 授权，再启动原 PlaybackCaptureService 与 Recorder；两路实际启动确认后才显示 RECORDING。没有 AudioFocus 请求、音量修改、麦克风输入或虚拟显示。原独立入口和 WAV 回放偏好保持；服务只增加可选会话 UUID、时间记录与停止状态，不重构原 PCM 读取循环。
+
+离开相机页、错误、某一路结束均驱动两路停止，等待视频 Finalize 和音频 WAV/时间记录定稿后离线合成。配置重建不续拍；合成线程使用应用 Context，可继续完成。每次捕获重新授权，Intent 只在内存短暂持有、移交服务后移除，不放入 Bundle/JSON/偏好；恢复合成只使用已完成文件，不重新用投影 token。启动/停止超时显示失败并保留数据。进程被强杀不保证定稿，不能宣称后台持久任务或自动恢复未完成采集。
+
+依据：[CameraX 视频捕获](https://developer.android.com/media/camera/camerax/video-capture)、[AudioPlaybackCapture](https://developer.android.com/media/platform/av-capture)、[MediaProjection 会话与释放](https://developer.android.com/media/grow/media-projection)、[前台服务类型与授权顺序](https://developer.android.com/about/versions/14/changes/fgs-types-required#media-projection)。
+
+## D014：BOOTTIME 时间记录与可验证的近似对齐
+
+查阅日期：2026-10-09；适用 API 29–36，目标 API 36。
+
+分别记录按钮点击、权限/投影结果、服务请求、Recorder 请求、CameraX Start 收到、第一份编码媒体 Status 收到、AudioRecord.startRecording 调用前后、首次 PCM read 返回、首个非零样本位置、AudioTimestamp 锚点、停止与定稿。时间基准为 SystemClock.elapsedRealtimeNanos 与 AudioTimestamp.TIMEBASE_BOOTTIME；真实静音也是有效 PCM，不能把“第一次非零”当作音频时间零点。
+
+音频起点采用多个 AudioRecord.getTimestamp 的 framePosition/nanoTime 回推帧零，取中位数，并记录所有原始锚点、起点离散度与观测采样率；没有有效时间戳时明确退化为“首次 read 返回减本块时长”的近似。该 API 是系统最佳估计，不保证播放捕获的绝对呈现精度或不存在溢出。暂不重采样修正漂移。
+
+CameraX 正式公开 Recorder API 没有绝对首个视频采集帧时间戳。已读取 Google Maven 正式 1.6.2 sources JAR 的 Recorder.java：Start 在编码器启动后、首个编码数据之前发出；recordedDurationNanos 来自当前视频编码 PTS 减首个编码 PTS，写入编码视频时更新 Status。因此用独立事件执行器收到 Status 的 BOOTTIME 减 recordedDuration 回推候选视频起点，取最小值降低可变交付延迟，记录首份观察、候选离散度和每秒原始观察。这仍包含编码/调度的未知延迟，离散度不是绝对误差上界；不能声称首帧曝光时间已测得。没有使用实验 Camera2Interop，也没有未经测量的固定同步偏移量。
+
+以视频轨时间线为最终范围：目标 PCM 帧 j 对应原 WAV 帧 j + round((videoOrigin-audioOrigin)×48000)。超出左边补零、提前的音频裁剪、右边不足补零、超长裁剪；保留 WAV 内原有开头静音。AAC 的实际 PTS 直接使用编码器输出，不因总时长相等而判断同步；未报告的 priming/蓝牙/显示差异通过物理镜面声光测试评估，不写死补偿。AudioTimestamp 原始锚点、videoCandidates、裁剪/填充数量和编码 PTS 写入本轮 JSON 供复核。
+
+依据：[AudioRecord.getTimestamp](https://developer.android.com/reference/android/media/AudioRecord#getTimestamp(android.media.AudioTimestamp,%20int))、[AudioTimestamp](https://developer.android.com/reference/android/media/AudioTimestamp)、[SystemClock](https://developer.android.com/reference/android/os/SystemClock)、[RecordingStats](https://developer.android.com/reference/androidx/camera/video/RecordingStats)、[CameraX 1.6.2 正式源码包](https://dl.google.com/dl/android/maven2/androidx/camera/camera-video/1.6.2/camera-video-1.6.2-sources.jar)。源码副本仅在忽略目录，不提交库源码。
+
+## D015：原生录后合成，发布成功后才清理
+
+查阅日期：2026-10-09；适用 API 29–36，目标 API 36。
+
+每个 UUID 会话私有保存 video.mp4、audio.wav/.part、audio-timing.json 和原子写入的 session.json。MediaCodec 将本轮对齐后的 PCM16/48kHz/立体声编码为 AAC-LC/192kbps，中间封装 AAC MP4 以保留编码格式与 PTS；MediaExtractor 读取 AVC 和 AAC，再由 MediaMuxer 封装。视频不重新编码，保留 csd、帧次序、相邻 PTS 差值与旋转元数据。读取器 SAMPLE_FLAG 与 Codec BUFFER_FLAG 不能直接混用，只映射关键帧标志。视频 PTS 以首帧归零；AAC 不随意平移，负 PTS 或非递增序列明确失败。当前只接受单一无音轨 H.264 来源和递增视频 PTS，不伪装支持 HEVC、B 帧重排或加密输入。
+
+目标时长采用视频轨 duration；缺失时由末帧 PTS 加观测帧间隔估计，不按按钮时间硬拉伸。空 EOS 样本标记视频与 AAC 最后一帧的期望结束时间，超出目标的编码填充包丢弃。同步偏移和编码延迟仍独立验收；容器等时长不是精准同步证据。
+
+最终先写私有 merged.mp4.part 并定稿，再向 MediaStore Movies/MusicCam 插入 IS_PENDING 项、保存 URI 到会话日志、复制、解析轨道、解除 pending。失败删除本轮未发布媒体项，保留私有源文件；可解析的原始无音轨视频尝试另存公开备份。最终发布及再次检查成功后仅删除本轮指定中间媒体，保留 JSON；发布完成但流程中断可据已记录 URI 重新确认，无需重新采集。失败重试不会删除历史独立 WAV。捕获进程强杀、磁盘满或 provider 故障无法保证恢复，必须报告实测范围。
+
+应用未引入 FFmpeg、额外依赖、权限或 SDK 组件。主机已有 ffprobe/ffmpeg 只独立验证容器与解码，Debug 框架 Instrumentation 只对合成测试文件运行原生编码/封装，并验证源文件哈希未改变；它不证明实际摄像头/播放捕获同步通过。
+
+依据：[MediaCodec](https://developer.android.com/reference/android/media/MediaCodec)、[BufferInfo](https://developer.android.com/reference/android/media/MediaCodec.BufferInfo)、[MediaExtractor](https://developer.android.com/reference/android/media/MediaExtractor)、[MediaMuxer 与 EOS 时长](https://developer.android.com/reference/android/media/MediaMuxer)、[MediaStore 本应用媒体与 pending](https://developer.android.com/training/data-storage/shared/media)、[AtomicFile](https://developer.android.com/reference/android/util/AtomicFile)。
+
+## D016：物理镜面声光同步测试，不把 UI 色块算作视频数据
+
+查阅日期：2026-10-09；目标设备 API 36。
+
+最小 SyncProbe 播放允许捕获的 MEDIA AudioTrack，48kHz PCM16 立体声，每秒 200ms/1kHz 脉冲；按实际 playbackHeadPosition 在 Choreographer 回调切换绿色块并记录提交显示时刻、播放头和路由类型。用户用镜子将手机屏幕真实拍入前置摄像头，不截屏、不把 View 渲染当相机采集。不会改变音量或请求焦点；为排除其他内容干扰，用户手动暂停音乐。
+
+主机工具提取视频实际 PTS 与绿色区域脉冲起点、解码 AAC 后每 10ms 检测 1kHz 脉冲，用完整首脉冲固定配对再报告中位/范围/漂移。数量不等、绿色对比不足、稳定对数不足会明确失败。测得的是播放头、显示刷新、蓝牙呈现、播放捕获、相机及 AAC 的全路径事件差，分辨率约一视频帧加 10ms；不能分解为某一 API 的精准延迟。只以实际文件结果更新 STATUS，不由看起来播放正常推断同步。
+
+2026-10-09 第一轮镜面实测：前置 MP4 及双轨解码正常，声光事件记录有 14 次脉冲/蓝牙 A2DP，但镜中屏幕较小且过曝，整体和屏幕 ROI 均无法可靠检测绿色起点；测试音前后仍存在持续声音。该轮同步测量明确未通过，不改变阈值或使用总时长/日志起点差代替测量。重测须由用户暂停背景音乐、降低屏幕亮度、增大镜中屏幕，并确认绿/暗变化可见；自动分析可选择实际色块 ROI，仍保留原判定条件和测量失败记录。
+
+同日第二轮镜面实测：片段开头/末尾屏幕离开画面，手机距离变化也影响色块面积；整段分析仍失败。工具增加显式 --interval，只选已确认连续可见的原始 PTS 区间，过滤两路观测而不平移或重新编码。9–17s 内 8 对脉冲可检测，4 对稳定样本局部音频滞后中位约 101ms，量化约 33.433+10ms；阈值公式未修改。每秒重复脉冲没有唯一周期标识，缺失开头不能排除整周期错配，因此该结果只算局部估计，不能证明绝对同步或据此加入固定补偿。后续测试优先采用带唯一启动标记/非周期编码的声光事件。本轮用户要求停止追加测试，保留局限并收尾。
+
+依据：[AudioTrack 播放头](https://developer.android.com/reference/android/media/AudioTrack#getPlaybackHeadPosition())、[Choreographer](https://developer.android.com/reference/android/view/Choreographer)、[捕获策略](https://developer.android.com/media/platform/av-capture#constraining_capture_by_other_apps)。设备结果与局限见 STATUS.md。
+
 ## D011：Phase 2 独立 CameraX 录像页，音频模块保持原样
 
 查阅日期：2026-10-09；适用 minSdk 29 / compileSdk、targetSdk 36。

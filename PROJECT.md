@@ -17,14 +17,17 @@ MusicCam 是一个计划在 GitHub 开源的 Android 相机应用。目标是让
 
 | 阶段 | 目标 | 验收依据 |
 | --- | --- | --- |
-| Phase 0（本次） | 环境检查、最小 Kotlin Android 项目、构建入口和工程文档 | 构建/Lint 的实际结果；单独记录是否真机启动 |
+| Phase 0 | 环境检查、最小 Kotlin Android 项目、构建入口和工程文档 | 构建/Lint 的实际结果；单独记录是否真机启动 |
 | Phase 1 | 单独验证 AudioPlaybackCapture，最小开始/停止与状态展示 | 授权、PCM 数据与可回放文件、允许/拒绝捕获音源对照、撤权释放、耳机路由实测 |
-| Phase 2（当前） | CameraX 独立摄像头预览、前后切换与无音轨 MP4 录像 | 真机画面、文件播放、时长、零音轨、音频模块回归、蓝牙音乐连续性 |
-| Phase 3 | 编码封装、恢复路径、产品 UI 和开源准备 | 真机回归、兼容性记录、许可证与发布资料 |
+| Phase 2 | CameraX 独立摄像头预览、前后切换与无音轨 MP4 录像 | 真机画面、文件播放、时长、零音轨、音频模块回归、蓝牙音乐连续性 |
+| Phase 3（当前） | 单次启动两路采集，录后原生 AAC 编码与 H.264/AAC MP4 合成 | 时间记录、真机回放、声光偏移测量、失败保留与独立功能回归 |
+| 后续 | 同步改进、兼容性与产品 UI、开源准备 | 长时与多路由验证、许可证与发布资料 |
 
 Phase 0 只有启动说明页。Phase 1 已实现 MediaProjection 授权、AudioPlaybackCapture / AudioRecord、mediaProjection 前台服务、WAV 保存与回放，以及自有测试音源；核心真机验收通过，实际结果与未完成异常测试见 STATUS.md。
 
-当前 Phase 2 新增独立 CameraX 录像页，仅增加 CAMERA 权限，保存无音轨 MP4 到 MediaStore 的 Movies/MusicCam。保留原音频页面和服务，不复用 WAV、不通过 MediaProjection 获取视频、不实现音视频合成或公共时间戳。后续同步方案需单独验证，高层 Recorder 不预设可注入外部 PCM。保持 minSdk 29 / compileSdk、targetSdk 36，无网络或存储权限。
+Phase 2 已完成独立 CameraX 无音轨录像。当前 Phase 3 在同一相机页增加独立的合成入口：统一控制器启动 CameraX Recorder 与既有 AudioPlaybackCapture，停止并等两路定稿后，将本轮 PCM/WAV 编码为 AAC，再无损复用 H.264 视频到 Movies/MusicCam。原独立音频/视频入口保留；本阶段不做 UI 美化、相册管理、实时封装或多机型适配。
+
+使用 BOOTTIME 单调时钟记录会话事件，AudioRecord 时间戳与 CameraX 编码事件估计两路起点；CameraX 正式公开 API 无绝对首帧采集时间戳，因此属于可测量的近似对齐，不宣称精准同步。音频按测得的起点裁剪/补静音，保留开头有效静音，尾部以视频时间线为准；AAC priming 和长时漂移仍须实测。MediaProjection 仅授权播放捕获，不是视频来源。每轮重新由用户授权，不复用历史 WAV。保持 minSdk 29 / compileSdk、targetSdk 36，无新增依赖、网络或存储权限。
 
 ## 已确认的技术限制
 

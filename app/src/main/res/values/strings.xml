@@ -1,6 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">MusicCam</string>
+    <string name="open_combined">摄像头 + 系统音频自动合成</string>
+    <string name="combined_intro">MusicCam · 音视频合成 PoC\n点击开始并完成本次系统授权，同时录制摄像头与允许捕获的播放音频；停止后自动生成 MP4。无麦克风。离开此页会停止并合成。</string>
+    <string name="combined_start">开始音视频录制</string>
+    <string name="combined_stop">停止并合成</string>
+    <string name="combined_retry">重试未完成的合成</string>
+    <string name="combined_probe">开始 / 停止声光同步测试</string>
     <string name="open_camera">独立摄像头录像（无音轨）</string>
     <string name="camera_intro">MusicCam · 摄像头录像 PoC\n优先 1080p / 30fps，按设备能力降级。无麦克风或系统音轨。离开此页面会停止并保存。</string>
     <string name="camera_permission">授权摄像头 / 重试预览</string>

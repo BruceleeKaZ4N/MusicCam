@@ -12,3 +12,5 @@ local.properties
 *.keystore
 captures/
 recordings/
+__pycache__/
+*.pyc

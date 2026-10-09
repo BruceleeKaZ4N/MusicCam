@@ -24,24 +24,34 @@ import android.os.SystemClock
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 
 /** One fresh authorization per foreground-service session; no microphone or virtual display. */
 class PlaybackCaptureService : Service() {
     data class Status(val active: Boolean = false, val stopping: Boolean = false,
-                      val message: String = "尚未开始录音", val file: File? = null)
+                      val message: String = "尚未开始录音", val file: File? = null,
+                      val sessionId: String? = null, val recordingStartedNs: Long = 0,
+                      val error: String? = null, val nonZeroSamples: Long = 0)
 
     companion object {
         const val ACTION_START = "dev.musiccam.prototype.START_CAPTURE"
         const val ACTION_STOP = "dev.musiccam.prototype.STOP_CAPTURE"
         const val EXTRA_CONSENT = "consent"
+        const val EXTRA_SESSION_ID = "session_id"
         const val SAMPLE_RATE = 48_000
         const val CHANNELS = 2
         @Volatile var status = Status()
             private set
         private var instance: PlaybackCaptureService? = null
+        private val pendingStops = ConcurrentHashMap<String, String>()
 
-        fun stop(reason: String) { instance?.requestStop(reason) }
+        fun stop(reason: String, sessionId: String? = null) {
+            val service = instance
+            if (service != null && (sessionId == null || service.sessionId == sessionId)) service.requestStop(reason)
+            else if (sessionId != null) pendingStops[sessionId] = reason
+        }
+        fun forgetCancellation(sessionId: String) { pendingStops.remove(sessionId) }
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -50,6 +60,8 @@ class PlaybackCaptureService : Service() {
     private var destroyed = false
     private var stopReason = "用户停止"
     private var projection: MediaProjection? = null
+    private var sessionId: String? = null
+    private var recordingStartedNs = 0L
     private val callback = object : MediaProjection.Callback() {
         override fun onStop() {
             PocLog.event(this@PlaybackCaptureService, "PROJECTION_REVOKED onStop")
@@ -71,6 +83,7 @@ class PlaybackCaptureService : Service() {
             return START_NOT_STICKY
         }
         if (started) {
+            intent?.removeExtra(EXTRA_CONSENT)
             PocLog.event(this, "START_IGNORED session already active")
             return START_NOT_STICKY
         }
@@ -79,7 +92,14 @@ class PlaybackCaptureService : Service() {
             return START_NOT_STICKY
         }
         started = true
-        status = Status(active = true, message = "正在初始化系统音频捕获…")
+        sessionId = intent.getStringExtra(EXTRA_SESSION_ID)
+        status = Status(active = true, message = "正在初始化系统音频捕获…", sessionId = sessionId)
+        val cancelled = sessionId?.let { pendingStops.remove(it) }
+        if (cancelled != null) {
+            intent.removeExtra(EXTRA_CONSENT)
+            complete("尚未开始采集，统一会话已取消：$cancelled", null, "会话在启动前取消")
+            return START_NOT_STICKY
+        }
         try {
             check(checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                 "缺少 RECORD_AUDIO 权限"
@@ -100,7 +120,7 @@ class PlaybackCaptureService : Service() {
             PocLog.event(this, "PROJECTION_READY callback registered; no virtual display")
             Thread({ capture(session) }, "MusicCam-PCM").start()
         } catch (e: Exception) {
-            complete("录制启动失败：${describe(e)}", null)
+            complete("录制启动失败：${describe(e)}", null, describe(e))
         } finally {
             // Never retain a consent Intent in our service's start Intent.
             intent.removeExtra(EXTRA_CONSENT)
@@ -143,6 +163,7 @@ class PlaybackCaptureService : Service() {
         var failure: String? = null
         var nonZero = 0L
         var peak = 0
+        var timing: AudioCaptureTiming? = null
         try {
             val minimum = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_STEREO,
                 AudioFormat.ENCODING_PCM_16BIT)
@@ -167,14 +188,19 @@ class PlaybackCaptureService : Service() {
                 audio.audioFormat == AudioFormat.ENCODING_PCM_16BIT) { "AudioRecord 返回的格式与预设不一致" }
             PocLog.event(this, "FORMAT rate=${audio.sampleRate} channels=${audio.channelCount} bits=16 minBuffer=$minimum buffer=$bufferBytes")
             if (!stopping.get()) {
-                val directory = File(filesDir, "recordings")
+                val directory = sessionId?.let { SessionStorage.directory(this, it) } ?: File(filesDir, "recordings")
                 check(directory.isDirectory || directory.mkdirs()) { "无法创建录音目录" }
-                val output = WavFile(File(directory, "capture-${System.currentTimeMillis()}.wav"), SAMPLE_RATE, CHANNELS)
+                val output = WavFile(File(directory, if (sessionId == null) "capture-${System.currentTimeMillis()}.wav" else "audio.wav"), SAMPLE_RATE, CHANNELS)
                 wav = output
+                if (sessionId != null) timing = AudioCaptureTiming(File(directory, "audio-timing.json"))
+                timing?.beforeStart()
                 audio.startRecording()
                 check(audio.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "AudioRecord 未进入录音状态" }
+                recordingStartedNs = SystemClock.elapsedRealtimeNanos()
+                timing?.afterStart()
                 main.post {
-                    if (!stopping.get() && !destroyed) status = Status(active = true,
+                    if (!stopping.get() && !destroyed) status = status.copy(active = true,
+                        recordingStartedNs = recordingStartedNs,
                         message = "正在捕获系统播放音频\n48000 Hz · 16-bit · 立体声\n可播放测试音，然后停止并检查结果。")
                 }
                 PocLog.event(this, "RECORDING_STARTED")
@@ -183,6 +209,7 @@ class PlaybackCaptureService : Service() {
                 var lastUpdate = lastRead
                 while (!stopping.get()) {
                     val count = audio.read(samples, 0, samples.size, AudioRecord.READ_NON_BLOCKING)
+                    val readReturnedNs = if (timing != null) SystemClock.elapsedRealtimeNanos() else 0L
                     check(count >= 0) { "AudioRecord.read 失败，返回码=$count" }
                     if (stopping.get()) break
                     if (count == 0) {
@@ -191,7 +218,9 @@ class PlaybackCaptureService : Service() {
                         continue
                     }
                     check(count % CHANNELS == 0) { "PCM 数据不是完整的立体声帧" }
+                    val framesBefore = output.dataBytes / (CHANNELS * 2)
                     output.append(samples, count)
+                    timing?.pcm(audio, samples, count, framesBefore, readReturnedNs)
                     for (i in 0 until count) {
                         val magnitude = abs(samples[i].toInt())
                         if (magnitude != 0) nonZero++
@@ -201,7 +230,7 @@ class PlaybackCaptureService : Service() {
                     if (lastRead - lastUpdate >= 1_000) {
                         val seconds = output.dataBytes.toDouble() / (SAMPLE_RATE * CHANNELS * 2)
                         val update = String.format(Locale.ROOT, "正在录音：%.1f 秒 · %d PCM 字节\n48000 Hz / PCM16 / 立体声 · 峰值 %d", seconds, output.dataBytes, peak)
-                        main.post { if (!stopping.get() && !destroyed) status = Status(active = true, message = update) }
+                        main.post { if (!stopping.get() && !destroyed) status = status.copy(active = true, message = update) }
                         lastUpdate = lastRead
                     }
                 }
@@ -222,6 +251,8 @@ class PlaybackCaptureService : Service() {
                 failure = listOfNotNull(failure, "WAV 保存失败：${describe(e)}").joinToString("；")
             }
             val bytes = wav?.dataBytes ?: 0L
+            try { timing?.finish(bytes / (CHANNELS * 2), nonZero, failure) }
+            catch (e: Exception) { failure = listOfNotNull(failure, "时间记录失败：${describe(e)}").joinToString("；") }
             val summary = when {
                 saved == null -> "未生成 WAV：${failure ?: "没有读到音频数据（$stopReason）"}"
                 else -> String.format(Locale.ROOT,
@@ -234,14 +265,18 @@ class PlaybackCaptureService : Service() {
             }
             PocLog.event(this, "CAPTURE_FINISHED bytes=$bytes nonZero=$nonZero peak=$peak saved=${saved?.name} error=${failure ?: "none"} reason=$stopReason")
             val result = saved
-            main.post { complete(summary, result) }
+            val error = failure
+            val nonZeroResult = nonZero
+            main.post { complete(summary, result, error, nonZeroResult) }
         }
     }
 
-    private fun complete(message: String, file: File?) {
+    private fun complete(message: String, file: File?, error: String? = null, nonZero: Long = 0) {
         releaseProjection()
-        status = Status(message = message, file = file)
-        getSharedPreferences("capture", MODE_PRIVATE).edit()
+        status = Status(message = message, file = if (sessionId == null) file else null,
+            sessionId = sessionId, recordingStartedNs = recordingStartedNs, error = error, nonZeroSamples = nonZero)
+        // A combined session's temporary WAV must not replace Phase 1's replay preference.
+        if (sessionId == null) getSharedPreferences("capture", MODE_PRIVATE).edit()
             .putString("message", message).putString("file", file?.name).apply()
         PocLog.event(this, "SESSION_CLOSED $message")
         stopForeground(STOP_FOREGROUND_REMOVE)

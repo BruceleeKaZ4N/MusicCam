@@ -6,6 +6,10 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.media.projection.MediaProjectionManager
+import android.os.SystemClock
+import android.view.View
+import org.json.JSONObject
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
@@ -35,10 +39,46 @@ import androidx.camera.view.PreviewView
 import java.util.Locale
 import java.util.UUID
 
-/** Independent foreground-only camera experiment. PlaybackCaptureService remains the audio owner.
- * Recorder owns video timestamps in this phase; external PCM and a common clock need a separate PoC.
- */
+/** Both modes keep CameraX as the video owner; the combined controller owns audio and composition. */
 class CameraActivity : ComponentActivity() {
+    companion object { const val EXTRA_COMBINED = "combined" }
+    private val combined get() = intent.getBooleanExtra(EXTRA_COMBINED, false)
+    private var combinedPending = false
+    private var combinedPermissionsPending = false
+    private var projectionPending = false
+    private var consent: Intent? = null // In-memory, single use; never save an authorization Intent.
+    private var buttonNs = 0L
+    private var authorization = JSONObject()
+    private var attachedController: CombinedSessionController? = null
+    private var syncProbe: SyncProbe? = null
+    private lateinit var syncView: TextView
+    private var retryButton: Button? = null
+    private var probeButton: Button? = null
+    private val combinedPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        combinedPermissionsPending = false
+        authorization.put("permissionsResultNs", SystemClock.elapsedRealtimeNanos())
+        if (!hasCameraPermission() || checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            combinedPending = false
+            statusView.text = "摄像头或播放音频权限被拒绝；未开始录制。永久拒绝时请在应用设置授权。"
+            PocLog.event(this, "PHASE3_PERMISSION_DENIED no_capture=true")
+        } else continueCombinedStart()
+        renderControls()
+    }
+    private val projectionResult = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        projectionPending = false
+        authorization.put("projectionResultNs", SystemClock.elapsedRealtimeNanos())
+        if (!combinedPending || isFinishing) return@registerForActivityResult
+        if (result.resultCode != RESULT_OK || result.data == null) {
+            combinedPending = false
+            statusView.setText(R.string.projection_denied)
+            PocLog.event(this, "PHASE3_PROJECTION_DENIED no_capture=true")
+        } else {
+            consent = result.data
+            PocLog.event(this, "PHASE3_PROJECTION_GRANTED fresh=true")
+            continueCombinedStart()
+        }
+        renderControls()
+    }
     private lateinit var previewView: PreviewView
     private lateinit var statusView: TextView
     private lateinit var resultView: TextView
@@ -61,7 +101,7 @@ class CameraActivity : ComponentActivity() {
     private var lens = CameraSelector.LENS_FACING_BACK
     private var configuration = ""
     private var stopReason = "用户停止"
-    private val preferences by lazy { getSharedPreferences("camera", MODE_PRIVATE) }
+    private val preferences by lazy { getSharedPreferences(if (combined) "combined" else "camera", MODE_PRIVATE) }
     private val resultsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> renderResult() }
     private val cameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         permissionPending = false
@@ -78,12 +118,21 @@ class CameraActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         lens = savedInstanceState?.getInt("lens") ?: CameraSelector.LENS_FACING_BACK
+        combinedPending = savedInstanceState?.getBoolean("combinedPending") ?: false
+        combinedPermissionsPending = savedInstanceState?.getBoolean("combinedPermissionsPending") ?: false
+        projectionPending = savedInstanceState?.getBoolean("projectionPending") ?: false
+        buttonNs = savedInstanceState?.getLong("buttonNs") ?: 0L
+        savedInstanceState?.getString("authorization")?.let { authorization = JSONObject(it) }
+        // A granted but not yet consumed Intent is deliberately discarded on reconstruction.
+        if (combinedPending && !projectionPending && !combinedPermissionsPending) combinedPending = false
         val spacing = (12 * resources.displayMetrics.density).toInt()
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(spacing, spacing, spacing, spacing)
         }
-        content.addView(TextView(this).apply { setText(R.string.camera_intro); textSize = 16f })
+        content.addView(TextView(this).apply { setText(if (combined) R.string.combined_intro else R.string.camera_intro); textSize = 16f })
+        syncView = TextView(this).apply { visibility = View.GONE }
+        content.addView(syncView, LinearLayout.LayoutParams(-1, (64 * resources.displayMetrics.density).toInt()))
         previewView = PreviewView(this).apply {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
             scaleType = PreviewView.ScaleType.FIT_CENTER
@@ -100,16 +149,38 @@ class CameraActivity : ComponentActivity() {
             }
         }
         val controls = LinearLayout(this)
-        startButton = button(controls, R.string.camera_start) { startRecording() }
-        stopButton = button(controls, R.string.camera_stop) { stopRecording("用户停止") }
+        startButton = button(controls, if (combined) R.string.combined_start else R.string.camera_start) {
+            if (combined) beginCombined() else startRecording()
+        }
+        stopButton = button(controls, if (combined) R.string.combined_stop else R.string.camera_stop) { stopRecording("用户停止") }
         switchButton = button(controls, R.string.camera_switch) {
             lens = if (lens == CameraSelector.LENS_FACING_BACK) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
             bindCamera()
         }
         details.addView(controls)
+        if (combined) for (index in 0 until controls.childCount) {
+            controls.getChildAt(index).layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
         resultView = TextView(this).apply { setTextIsSelectable(true) }
         details.addView(resultView)
         openButton = button(details, R.string.camera_open_video) { openVideo() }
+        if (combined) {
+            retryButton = button(details, R.string.combined_retry) {
+                val id = preferences.getString("recoverableId", null)
+                if (id != null && !busy()) try {
+                    CombinedSessionController.retry(this, id)
+                    attachCombined()
+                } catch (e: Exception) { reportError("无法重试，原始数据仍保留", e) }
+            }
+            probeButton = button(details, R.string.combined_probe) {
+                val active = CombinedSessionController.active
+                if (active?.state == CombinedSessionController.State.RECORDING) try {
+                    if (syncProbe != null) stopProbe() else {
+                        SyncProbe(syncView, active.directory).also { it.start(); syncProbe = it }
+                    }
+                } catch (e: Exception) { reportError("声光测试失败", e) }
+            }
+        }
         button(details, R.string.camera_back) { finish() }
         content.addView(ScrollView(this).apply { addView(details) },
             LinearLayout.LayoutParams(-1, minOf(320 * resources.displayMetrics.density,
@@ -130,6 +201,7 @@ class CameraActivity : ComponentActivity() {
         preferences.registerOnSharedPreferenceChangeListener(resultsListener)
         renderResult()
         renderControls()
+        attachCombined()
         PocLog.event(this, "PHASE2_CAMERA_PAGE api=${Build.VERSION.SDK_INT} audioEnabled=false")
     }
 
@@ -141,10 +213,12 @@ class CameraActivity : ComponentActivity() {
 
     private fun hasCameraPermission() = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
     private fun isResumed() = resumed && !isFinishing && !isDestroyed
-    private fun busy() = recording != null || finalizing
+    private fun busy() = recording != null || finalizing ||
+        (combined && (combinedPending || CombinedSessionController.active != null))
 
     private fun bindCamera() {
-        if (!isResumed() || busy() || loading || !hasCameraPermission()) return
+        if (!isResumed() || recording != null || finalizing || loading || !hasCameraPermission() ||
+            (combined && CombinedSessionController.active != null)) return
         if (provider == null) {
             loading = true
             statusView.text = "正在初始化摄像头…"
@@ -207,7 +281,8 @@ class CameraActivity : ComponentActivity() {
                     camera.cameraInfo.cameraState.observe(this) { state ->
                         state.error?.let { error ->
                             ready = false
-                            stopRecording("摄像头异常")
+                            if (combined) CombinedSessionController.active?.abort("摄像头异常 code=" + error.code)
+                            else stopRecording("摄像头异常")
                             statusView.text = "摄像头不可用：code=${error.code}；请停止后重试预览。"
                             PocLog.event(this, "PHASE2_CAMERA_ERROR code=${error.code}")
                             renderControls()
@@ -215,6 +290,7 @@ class CameraActivity : ComponentActivity() {
                     }
                     PocLog.event(this, "PHASE2_CAMERA_BOUND $configuration supported=$supported frameRates=$frameRates")
                     renderControls()
+                    continueCombinedStart()
                     return
                 } catch (e: Exception) {
                     lastError = e
@@ -224,6 +300,80 @@ class CameraActivity : ComponentActivity() {
             }
             throw lastError ?: IllegalStateException("预览与录像组合不可用")
         } catch (e: Exception) { reportError("摄像头绑定失败", e) }
+    }
+
+    private fun beginCombined() {
+        if (busy() || !isResumed() || PlaybackCaptureService.status.active) return
+        combinedPending = true
+        buttonNs = SystemClock.elapsedRealtimeNanos()
+        authorization = JSONObject()
+        consent = null
+        val permissions = listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO) +
+            if (Build.VERSION.SDK_INT >= 33) listOf(Manifest.permission.POST_NOTIFICATIONS) else emptyList()
+        val missing = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) {
+            combinedPermissionsPending = true
+            authorization.put("permissionsRequestNs", SystemClock.elapsedRealtimeNanos())
+            try { combinedPermissions.launch(missing.toTypedArray()) }
+            catch (e: Exception) { reportError("无法请求权限", e) }
+        } else continueCombinedStart()
+        renderControls()
+    }
+
+    private fun continueCombinedStart() {
+        if (!combined || !combinedPending || !isResumed() || combinedPermissionsPending || projectionPending) return
+        if (!hasCameraPermission() || checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            combinedPending = false
+            statusView.text = "权限已撤回；未开始录制。"
+            renderControls()
+            return
+        }
+        if (!ready) { bindCamera(); return }
+        val freshConsent = consent
+        if (freshConsent == null) {
+            try {
+                projectionPending = true
+                authorization.put("projectionRequestNs", SystemClock.elapsedRealtimeNanos())
+                statusView.setText(R.string.waiting_projection)
+                projectionResult.launch(Intent(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent()))
+                PocLog.event(this, "PHASE3_PROJECTION_REQUEST fresh=true")
+            } catch (e: Exception) {
+                projectionPending = false
+                combinedPending = false
+                reportError("无法打开系统授权", e)
+            }
+        } else {
+            consent = null
+            combinedPending = false
+            try {
+                val video = capture ?: error("摄像头未就绪")
+                video.targetRotation = previewView.display?.rotation ?: Surface.ROTATION_0
+                CombinedSessionController.start(this, video, freshConsent, buttonNs, authorization, configuration)
+                attachCombined()
+            } catch (e: Exception) { reportError("无法启动统一录制；请重新授权", e) }
+        }
+        renderControls()
+    }
+
+    private fun attachCombined() {
+        if (!combined) return
+        val active = CombinedSessionController.active
+        if (attachedController !== active) attachedController?.listener = null
+        attachedController = active
+        active?.listener = {
+            statusView.text = active.message
+            if (!active.canStop) stopProbe()
+            if (active.canStop && isResumed()) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            renderResult()
+        }
+        active?.listener?.invoke()
+    }
+
+    private fun stopProbe() {
+        val probe = syncProbe ?: return
+        syncProbe = null
+        try { probe.stop() } catch (e: Exception) { PocLog.event(this, "PHASE3_PROBE_SAVE_FAILED " + e.javaClass.simpleName) }
     }
 
     private fun startRecording() {
@@ -269,6 +419,12 @@ class CameraActivity : ComponentActivity() {
     }
 
     private fun stopRecording(reason: String) {
+        if (combined) {
+            stopProbe()
+            CombinedSessionController.active?.stop(reason)
+            renderControls()
+            return
+        }
         val active = recording ?: return
         if (stopping) return
         stopping = true
@@ -322,6 +478,14 @@ class CameraActivity : ComponentActivity() {
     }
 
     private fun renderResult() {
+        if (combined) {
+            val recovery = preferences.getString("recoverableId", null)
+            resultView.text = preferences.getString("message", "停止后自动保存到 Movies/MusicCam。") +
+                if (recovery != null && CombinedSessionController.active == null)
+                    "\n存在未完成会话；原始数据保留在应用内，卸载会丢失。可尝试重新合成。" else ""
+            renderControls()
+            return
+        }
         val pending = preferences.getString("pending", null)
         resultView.text = (if (pending == null) "" else "会话尚未确认定稿：$pending。进程终止后不能视为成功录像。\n") +
             preferences.getString("message", "视频将保存在 Movies/MusicCam，相册或文件管理器可访问。")
@@ -329,8 +493,16 @@ class CameraActivity : ComponentActivity() {
     }
 
     private fun renderControls() {
-        startButton.isEnabled = ready && !busy() && hasCameraPermission() && isResumed()
-        stopButton.isEnabled = recording != null && !stopping
+        startButton.isEnabled = !busy() && isResumed() &&
+            if (combined) !PlaybackCaptureService.status.active else ready && hasCameraPermission()
+        if (combined) {
+            stopButton.isEnabled = CombinedSessionController.active?.canStop == true
+            retryButton?.isEnabled = !busy() && !PlaybackCaptureService.status.active &&
+                preferences.getString("recoverableId", null) != null
+            probeButton?.isEnabled = CombinedSessionController.active?.state == CombinedSessionController.State.RECORDING
+        } else {
+            stopButton.isEnabled = recording != null && !stopping
+        }
         switchButton.isEnabled = !busy() && !loading && !permissionPending && hasCameraPermission()
         permissionButton.isEnabled = !busy() && !loading && !permissionPending
         openButton.isEnabled = !busy() && preferences.getString("uri", null) != null
@@ -346,6 +518,12 @@ class CameraActivity : ComponentActivity() {
 
     private fun lensName() = if (lens == CameraSelector.LENS_FACING_BACK) "后置" else "前置"
     private fun reportError(prefix: String, error: Exception) {
+        if (combinedPending && CombinedSessionController.active == null) {
+            combinedPending = false
+            combinedPermissionsPending = false
+            projectionPending = false
+            consent = null
+        }
         statusView.text = "$prefix：${error.javaClass.simpleName}: ${error.message ?: "无详细信息"}"
         PocLog.event(this, "PHASE2_ERROR ${statusView.text}")
         renderControls()
@@ -365,7 +543,9 @@ class CameraActivity : ComponentActivity() {
         super.onResume()
         resumed = true
         if (!hasCameraPermission()) { ready = false; unbindCamera() }
-        else if (!busy()) bindCamera()
+        else if (CombinedSessionController.active == null && recording == null && !finalizing) bindCamera()
+        attachCombined()
+        continueCombinedStart()
         renderResult()
     }
 
@@ -378,10 +558,18 @@ class CameraActivity : ComponentActivity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putInt("lens", lens)
+        outState.putBoolean("combinedPending", combinedPending)
+        outState.putBoolean("combinedPermissionsPending", combinedPermissionsPending)
+        outState.putBoolean("projectionPending", projectionPending)
+        outState.putLong("buttonNs", buttonNs)
+        outState.putString("authorization", authorization.toString())
         super.onSaveInstanceState(outState)
     }
 
     override fun onDestroy() {
+        consent = null
+        attachedController?.listener = null
+        stopProbe()
         stopRecording("录像页面销毁")
         unbindCamera()
         preferences.unregisterOnSharedPreferenceChangeListener(resultsListener)

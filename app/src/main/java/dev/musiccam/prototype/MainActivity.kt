@@ -57,6 +57,10 @@ class MainActivity : Activity() {
             setPadding(spacing, spacing, spacing, spacing)
         }
         content.addView(TextView(this).apply { setText(R.string.phase_one_intro); textSize = 18f })
+        button(content, R.string.open_combined) {
+            stopPlayback()
+            startActivity(Intent(this, CameraActivity::class.java).putExtra(CameraActivity.EXTRA_COMBINED, true))
+        }
         button(content, R.string.open_camera) {
             startActivity(Intent(this, CameraActivity::class.java))
         }
@@ -102,7 +106,7 @@ class MainActivity : Activity() {
         Button(this).apply { setText(label); setOnClickListener { action() }; parent.addView(this) }
 
     private fun begin() {
-        if (pending || startingService || PlaybackCaptureService.status.active) return
+        if (pending || startingService || PlaybackCaptureService.status.active || CombinedSessionController.active != null) return
         stopReplay()
         pending = true
         localMessage = null
