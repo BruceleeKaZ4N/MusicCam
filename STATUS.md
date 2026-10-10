@@ -1,6 +1,60 @@
 # MusicCam 当前状态
 
-更新时间：2026-10-09（Asia/Shanghai）。
+更新时间：2026-10-10（Asia/Shanghai）。
+
+## Phase 4A：MediaProjection 授权体验优化（已完成，连续拍摄仅分析）
+
+2026-10-09～10：基于 Phase 3 提交 c559a6a 开始，初始 `git status --short` 为空。完整阅读 AGENTS/PROJECT/DECISIONS/STATUS 和实际授权、服务、控制器、时间记录、存储/合成代码。只修改两个授权请求入口，连续拍摄完成分析后暂停，等待维护者决定 Phase 4A-2；未 Commit/Push。约 100ms 局部同步估计与周期配对歧义保持 Phase 3 记录，本次不追加声光测试。
+
+### 已修改与源码确认
+
+- CameraActivity.continueCombinedStart() 与 MainActivity.requestProjection()：API 34+ 调用 `createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())`，API 29–33 保留无参数调用；日志增加请求 scope。系统授权仍需用户确认，每个新录制会话仍重新授权。没有改变 result callback、授权消费/释放或录制状态机。
+- PlaybackCaptureService / CombinedSessionController / AudioCaptureTiming / SessionStorage / AudioVideoComposer / AudioAlignment / CameraX 配置均未修改；没有新增依赖、权限、VirtualDisplay 或 SDK/Gradle 变更。
+- DECISIONS.md D017 记录官方行为和 API 范围；D018 记录源码调用链、生命周期耦合、按全局 PCM 帧边界切片/BOOTTIME 换算、独立定稿/合成、撤权/空闲释放、预计文件及风险和验证计划。PROJECT.md 进度更新到 Phase 4A。
+- 当前每段停止都会停止/释放 AudioRecord 和 MediaProjection；服务 `started/stopping` 与 UUID/WAV、控制器 `active` 均按单段管理，不能通过复用旧 Intent 实现连续拍摄。建议音乐模式持有一次有效授权与持续 AudioRecord、每段独立 WAV/时间报告、片段间 PCM 读取后丢弃、首版串行合成；属于实质生命周期调整，仅分析、未实施。
+
+### 当前环境与实际验证
+
+复用 `source .local/env.sh`；`android.builder.sdkDownload=false` 保持不变。证据和媒体仅保存在被忽略的 `.local/phase4a/`，不登记设备序列号、账户、曲目和授权 token。
+
+| 验证 | 实际命令与结果 |
+| --- | --- |
+| 工程与工具 | Git 状态干净；`./gradlew --version`：Gradle 9.7.1 / JDK 17.0.20.1；版本及全局配置未改 |
+| 构建/Lint | `./gradlew --offline --no-daemon :app:assembleDebug :app:lintDebug`：BUILD SUCCESSFUL in 17s，46 任务（13 executed / 33 up-to-date）；build.log |
+| Lint 报告 | 0 errors / 19 warnings，与 Phase 3 数量一致；没有新增 suppression/baseline。既有 Gradle 10 弃用提示仍在 |
+| APK 检查 | 已有 Build Tools 36.0.0 `apksigner verify` 通过；`aapt2 dump badging` 确认 targetSdk 36 和既有权限。APK SHA-256 cce7c339afd4f1a2aa76575a78b7267c1201f1ea007ae7811c3046d3316967dd，apk-sha256.txt |
+| ADB | 首次 `adb devices -l` 为唯一 USB `device`；后续核实时短暂 `no devices found`，重新连接后恢复 `device`；没有已授权设备期间未执行真机检查 |
+| 设备/音源 | getprop 实测 vivo V2527A / Android 16 / API 36 / PD2527C_A_16.0.19.3.W10；网易云 `dumpsys package`：9.6.05 / 9006005 / targetSdk33。内容与实际路由由本轮人工测试另行确认，不能沿用历史听感 |
+| 安装启动 | 无旧活动捕获服务（`dumpsys activity services dev.musiccam.prototype` 为 nothing），`adb -d install -r <Debug APK>` Success，install.log；`am start -W --user 0 -n dev.musiccam.prototype/.MainActivity` COLD / Status ok / TotalTime277ms，launch.txt；截图确认音频页显示 |
+| UI 辅助检查 | `uiautomator dump` 未取得 idle state，未生成 XML；不算授权 UI 验证，不操作系统同意按钮。改用只读截图与人工反馈；ui-dump.log |
+| 截图尺寸辅助读取 | 主机尝试 Python PIL 读取尺寸因 ModuleNotFoundError 失败；没有安装库，改用现有 `sips -g pixelWidth -g pixelHeight <截图>` 得到1216×2640；不是音视频功能验证 |
+| 代码/文档检查 | `git diff --check` 通过；仅两处增加 API34 分支，未修改时间戳/合成逻辑。API29–33 无对应设备，fallback 未做运行验收 |
+
+### 本次真机回归清单（与历史结果分开）
+
+| 项目 | 本阶段结果 |
+| --- | --- |
+| 授权弹窗默认整个显示屏 | 已观察：当前 APK 合成入口的系统弹窗范围显示「共享整个屏幕」，projection-dialog.png；仍有系统「开始」确认按钮 |
+| 是否免手动切换共享范围 | 已观察：范围项灰色，展开显示「共享整个屏幕」及「MusicCam 已停用此选项」；无需先从「共享一个应用」切换，本机未覆盖默认显示屏配置 |
+| 网易云可捕获内容/音频数据 | 用户按蓝牙网易云歌曲指引测试后回复「正常」；原 PCM 142,336 帧 / 272,359 非零样本 / 峰值25,296、error=null；不推定所有曲目 |
+| 真实摄像头录像 | 后置短片定稿，CameraX error=0，用户反馈正常；本轮未新增前置短片，Phase 3 前置结果仅为历史依据 |
+| 停止后 H.264 + AAC MP4 | 4c0f1895 会话 DONE / 两路 finalized=true / 用户停止；独立 ffprobe 单 H.264 High 1920×1080 / 单 AAC-LC 48kHz立体声，ffmpeg 双轨完整解码 exit0，combined/inspection.json、decode.log |
+| 输出音乐可正常回放 | 用户针对取消/相机/合成/音乐回放/蓝牙是否中断的指引回复「正常」；另做输出 AAC 解码/非零检查，不以容器通过代替听感 |
+| 蓝牙耳机音乐不中断 | 用户按本轮蓝牙网易云指引反馈「正常」；此为本轮人工结果，未读取耳机地址或声称覆盖其他路由 |
+| 用户拒绝授权安全退出 | 事件 PHASE3_PROJECTION_DENIED no_capture=true，拒绝后无 PHASE3_BEGIN/FGS；直到下一次 fresh 请求/授权才启动；人工回复正常 |
+| 独立音频测试/WAV 回放 | 已通过：新授权、允许测试音 ALL、独立 WAV 非静音预期/完整 MediaPlayer 回放；用户回复「已完成，回放有声正常」。本轮实际测试音路由type=2（扬声器），与合成短片的人工蓝牙结果分开 |
+
+人工确认「倒是没有选择了，可以点‘开始’。点开始后，默认就是共享整个屏幕」，与弹窗截图一致；针对其余合成路径回复「正常」。系统授权与取消均由用户本人完成；应用内入口可通过 ADB 打开，未通过 ADB/无障碍点击系统确认。Phase 3 已通过项仅保留为下方历史记录，本阶段结果以上述当前 APK 实际观察为准。
+
+本轮实际 MP4 为 MusicCam-AV-4c0f1895-79e5-4b0f-a661-716410edb350.mp4：8,740,015 字节，视频78帧 / 2.625833s，AAC124包 / 2.625896s；两轨 start_time=0，完整双轨解码通过。指引建议约10秒，实际仅2.626秒，结论限于此短片，不冒充10秒或长时回归。原 PCM 2.965333s 非静音；最终发布后只留下 session/audio-timing/composition JSON，cleanupRemaining=[]；停止后服务为 nothing。实际命令：`adb -d pull <本轮MP4> .local/phase4a/combined/output.mp4`；`ffprobe -v error -show_streams -show_format -of json <文件>`；`ffmpeg -v error -xerror -i <文件> -map 0:v:0 -map 0:a:0 -f null -`。本阶段没有测同步，时长/双轨回放不是精准同步证据。
+
+输出 AAC 独立解码为 PCM 后有252,086个样本、237,789个非零、峰值25,079、RMS4034.75，combined/decoded-audio-check.json；它证明输出非静音，实际网易云内容正确与蓝牙不中断仍依赖本轮人工确认。
+
+独立音频 capture-1791641277824.wav：1,433,644字节、358,400帧 / 7.466667s / 48kHz / PCM16 / 2声道，左右非零230,016 / 229,632、峰值均5,000，RIFF/data一致，`--expect non-silent` 通过。实际命令：`adb -d exec-out run-as dev.musiccam.prototype cat files/recordings/capture-1791641277824.wav > .local/phase4a/audio/capture-1791641277824.wav`，`python3 tools/inspect_wav.py <文件> --expect non-silent`，报告audio/inspection.json。事件独立入口 `fresh=true scope=default_display` → 用户批准 → FGS/PROJECTION_READY/RECORDING_STARTED；允许测试音在授权前已播放，实际路由type=2；停止测试音后通过「用户退出应用」结束录音，再重新打开回放，WAV_PLAYBACK_STARTED durationMs=7467 / COMPLETED，error=none。本轮停止方式与建议的「停止录音」按钮不同，如实记录，不重测凑操作顺序。最终捕获服务nothing，service-final.txt。拒绝策略基线、前置独立无音轨录像、失败保留对照与同步测量未新增运行，沿用 Phase 3 历史范围，不冒充本阶段复测。
+
+### 下一步与边界
+
+Phase 4A 按本轮弹窗、取消授权、后置短片合成/音乐回放/蓝牙及独立音频结果收尾；最后 `git diff --check` 通过。系统主动撤权、其他 API/厂商、长时漂移与更多异常并非本轮已验证范围；连续拍摄必须待维护者决定 Phase 4A-2 后实施。任何失效 projection、Intent/token 或进程重启都不能跨会话免授权。
 
 ## Phase 3：系统音频与摄像头录后自动合成 PoC（最小原型完成，同步有局限）
 

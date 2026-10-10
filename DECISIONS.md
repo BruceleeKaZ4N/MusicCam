@@ -2,6 +2,70 @@
 
 记录日期：2026-10-08。构建可行性与设备可行性分开验收；尚未实测的方案保持待验证。
 
+## D017：API 34+ 显式请求默认显示屏，保留每次系统同意
+
+查阅日期：2026-10-09～10（Asia/Shanghai）；适用 minSdk 29 / compileSdk、targetSdk 36。
+
+源码核实有两处请求：CameraActivity.continueCombinedStart()（合成录像）和 MainActivity.requestProjection()（独立音频）。两处均在 SDK_INT >= 34 时调用 MediaProjectionConfig.createConfigForDefaultDisplay()，再调用 MediaProjectionManager.createScreenCaptureIntent(config)；API 29–33 保留无参数版本。就地加版本分支，不引入新授权模块或依赖；日志只增加请求范围 default_display/legacy，不记录授权内容，也不声称该日志证明厂商弹窗实际范围。
+
+官方预期为仅请求默认显示屏、免去单应用范围选择；API 与配置均从 34 提供，无参数版本等价于用户选择配置。系统仍提示用户同意，厂商可覆盖退出单应用共享的配置，实际 UI 必须另行观察。不使用自动点击授权、隐藏 API 或特殊权限，不创建 VirtualDisplay，不改变 CameraX、AudioRecord、合成、BOOTTIME 和释放路径。每次录制仍是一轮新授权；这项改动不实现连续拍摄。
+
+来源：[MediaProjectionConfig](https://developer.android.com/reference/android/media/projection/MediaProjectionConfig#createConfigForDefaultDisplay())、[MediaProjectionManager 授权请求](https://developer.android.com/reference/android/media/projection/MediaProjectionManager#createScreenCaptureIntent(android.media.projection.MediaProjectionConfig))、[单应用共享退出与厂商覆盖](https://developer.android.com/media/grow/media-projection#opt_out)。构建和本次 vivo 实际行为见 STATUS.md Phase 4A。
+
+本次设备观察：vivo V2527A / Android16 / API36 / PD2527C_A_16.0.19.3.W10，合成入口弹窗范围显示「共享整个屏幕」、范围项灰色，展开提示「MusicCam 已停用此选项」，仍有系统「开始」按钮。此设备遵循请求配置，无需手动切换范围；不能由一台设备推广到其他厂商或系统版本。
+
+## D018：一次有效授权支持多段相机视频的可行性（仅分析，未实施）
+
+查阅日期：2026-10-09～10；评估 API 29–36，Android 14–16 / targetSdk 36 的生命周期约束。以下是基于源码和官方 API 的设计推论，连续拍摄尚无设备验证，实施暂停至维护者决定 Phase 4A-2。
+
+### 当前调用链与耦合
+
+合成入口：CameraActivity.beginCombined() → 权限结果 → continueCombinedStart() → 系统投影结果；新 Intent 只在内存临时存放，消费前清空 consent → CombinedSessionController.start()/begin()。控制器创建单段 UUID，启动 PlaybackCaptureService.ACTION_START，再启动禁用 CameraX audio 的 Recorder。服务先 startForeground(mediaProjection)，再 getMediaProjection() 一次、注册 onStop()，工作线程构建 AudioPlaybackCaptureConfiguration 与单个 AudioRecord，写这段目录的 audio.wav.part 并记录 BOOTTIME。控制器以 100ms 轮询音频状态并接收 CameraX 事件，两路实际启动才进入 RECORDING。
+
+正常停止/离开相机页/配置变化/相机错误 → CombinedSessionController.stop()/abort() → PlaybackCaptureService.stop(reason, id) 与 Recording.stop()。音频工作线程退出后 stop/release AudioRecord → WAV.finish() → AudioCaptureTiming.finish() → complete() → unregisterCallback、MediaProjection.stop()、移除前台通知、stopSelf()。CameraX Finalize 收到后关闭 Recording；控制器等待两路定稿，再编码/发布。成功只清理该 UUID 中间媒体，失败保留并尝试导出无音轨视频；retry() 只读取已完成文件、不再授权。
+
+系统撤权：PlaybackCaptureService.callback.onStop() → requestStop() → 音频线程定稿与 complete()；控制器轮询到音频不再 active，停止相机并汇合。现有实现不是 onStop 同步直达控制器，相机停止要经过音频结束和轮询。服务 onDestroy/onTaskRemoved、通知 ACTION_STOP 也请求停止。onDestroy 先释放 projection，工作线程以停止标志退出；进程强杀不保证执行。纯音频独立入口 MainActivity.onActivityResult() 直接启动同一服务，sessionId=null，写 recordings/ 并更新独立回放偏好；其 Home 行为与相机页离开即停不同。
+
+无法直接连续拍摄的原因：服务的 started/stopping 是单次不可恢复状态，第二次 ACTION_START 被忽略；sessionId、WavFile、AudioCaptureTiming 和 status 都属于一段录像。stop() 会关闭投影和服务；控制器 active 直到合成完成才清空，并以 !audio.active 作为音频定稿信号；CameraActivity 离开就停止整个会话。删掉 MediaProjection.stop() 一行会留下失去 AudioRecord/状态管理的会话，不能解决这些耦合。
+
+### 推荐的最小方案
+
+可行方向是在用户明确进入音乐拍摄模式时取得一次新授权，由前台服务持有一个仍有效的 MediaProjection 和一个持续运行的 AudioRecord；A/B/C 是该音频会话内的独立文件片段，CameraX 继续每段 prepare/start/stop/Finalize。仅首次调用 getMediaProjection()，不重复消费结果 Intent、不持久化 token、不创建 VirtualDisplay。服务技术上能持续运行（现有独立音频模式已经可在 Home 后继续），但目前代码需调整所有权；文档没有保证纯音频会话永久有效，系统可随时结束它。
+
+将“结束片段”与“结束音乐模式”分成两个命令：结束片段只定稿其 WAV/视频，结束模式才停止 AudioRecord、projection 和前台服务。为控制改动，第一版仍串行完成 A 的定稿/合成后才允许 B 开始，期间保留有效音频会话，避免新增并行合成队列。若产品要求 A 合成同时拍 B，需另行扩大范围；不必为免重复授权引入此复杂度。
+
+音频线程持续及时读取，只在片段打开期间写文件，片段间读到的 PCM 直接丢弃；不写一份贯穿整个模式的长 WAV。所有片段打开/关闭由同一音频线程在完整立体声帧边界串行执行，并带模式 generation 和片段 UUID 回执，拒绝陈旧命令。开始片段先确认 WAV 已打开，再请求 CameraX 开始；停止先请求 CameraX.stop()，待其 Finalize 后关闭片段 WAV（有定稿超时），保留覆盖视频实际尾部的 PCM，再由已有算法裁剪。这样无需最初就实现共享文件索引、环形缓存或改编码器；Finalization 等待期间仍采集音频，应明确展示并设上限。
+
+每段保存独立 video.mp4、audio.wav/.part、audio-timing.json、session.json。音频模式建立全局已读帧计数，空档丢弃的数据也计数；片段记录 [startFrameInclusive,endFrameExclusive)，局部帧 k 对应全局 startFrame+k。写入帧数必须等于 end-start，非零计数/首非零位置局部化，真实静音保持有效，不拿非零样本作时间原点。
+
+保持 elapsedRealtimeNanos/TIMEBASE_BOOTTIME：若连续音频锚点为 (F,T)，片段从全局帧 S 开始，则其帧零候选为 T-(F-S)×10^9/48000，等价于全局起点+S×10^9/48000。只选片段附近且连续有效的锚点，冻结每段报告后不再随后续数据改写；保留原始全局锚点、S/E 和估计离散度以便审计。局部首次 read 回推仍只能是带标记的近似 fallback。AudioRecord 时间戳计数与已读帧序列的一致性需实际验证，不能遇到溢出/丢帧/ERROR_DEAD_OBJECT 后假定连续；异常结束当前模式并保留受影响片段，下一次重新授权。不能对每段 AudioRecord.stop/start 后仍使用旧 framePosition 原点。
+
+CameraX 的每段 Status 起点算法保持；给既有 AudioVideoComposer/AudioAlignment 提供片段自己的 originEstimateNs 和 WAV，继续按视频实际时间范围裁剪/补静音，AAC 编码器与 muxer 不变。同步仍是 Phase 3 的近似，不把连续捕获当作修复约 100ms 局部偏差；不加固定补偿。
+
+onStop() 或读错时立即将模式标为不可用，阻止新片段、废弃所有待启动命令，并通知活动控制器停止相机；音频线程完成有限定稿/释放。已有完成片段可继续离线合成，当前片段记录撤权/错误并保留，不能用撤权后的静音伪装成功。Notification 停止、退出模式、离开页面/锁屏、权限撤回同样结束模式，清除内存引用；若返回页面再次进入必须新授权。不依赖纯音频在这台手机上曾锁屏不断的历史观察作为保留后台授权的保证。
+
+每段等待“该 WAV 与时间报告已定稿”的回执，不再等待整个服务 inactive。每段仍独立使用 SessionStorage.publish() 的 pending/检查/发布与 cleanupMedia()，失败只影响该 UUID，模式停止不删除已完成媒体；合成失败后其他片段及独立 WAV 不受影响。最低方案不增加共享长文件，所以成功清理不会删掉其他片段正使用的 PCM；recoverableId 目前只能表示一个失败片段，多失败管理暂不扩大、需明确这一限制。
+
+### 文件、风险和验收
+
+| 预计修改文件 | 最小必要调整 |
+| --- | --- |
+| CameraActivity.kt | 模式授权/进入/退出、片段开始停止、离开结束模式、按模式与片段分别显示状态 |
+| PlaybackCaptureService.kt | 模式持有 projection/AudioRecord；片段写入命令与定稿回执；模式 generation、全局帧计数、撤权即时通知、空档丢弃 |
+| CombinedSessionController.kt | 不再每段接收授权/启动服务；按片段回执汇合，分离片段停止和模式停止，保留每段状态/失败/串行合成 |
+| AudioCaptureTiming.kt | 连续锚点采样与片段起点/计数换算、逐段冻结报告、连续性检查；保留 BOOTTIME |
+| SessionStorage.kt | 记录模式关联及片段帧范围；保持每段私有文件/原子写入/独立清理，避免共享可变报告 |
+| MainActivity.kt / strings.xml | 独立音频与音乐模式互斥、明确持续捕获与结束入口、通知/页面状态文案 |
+| PROJECT.md / DECISIONS.md / STATUS.md / README.md | 更新生命周期、操作与实际验收范围 |
+
+预计无需修改 AudioVideoComposer.kt、AudioAlignment.kt、WavFile.kt 或 Gradle/Manifest 权限；若逐段输出契约未能兼容，应先明确差异。调整横跨服务、控制器、UI 和时序，属于实质生命周期重构，不能附带在本次弹窗优化中实施。
+
+主要风险是读线程/命令/撤权竞态、全局帧与时间戳失配、长时漂移、定稿等待尾部、电量和热量、写入/合成争用、单失败偏好覆盖，以及旧 UI 无法区分“已停片段但还在捕获”。最小方案只在页面可见的音乐模式保持捕获，持续通知和页面指示，提供随时结束入口；空档不持久化 PCM，设有限空闲超时和单段/模式时长上限，退出/后台/锁屏主动停止，不静默自动重新授权。不用 AudioRecord 停启节电来换取未经验证的旧 token 重建；空闲超时结束后下次明确授权。具体超时数值在 Phase 4A-2 选定并实测功耗，不宣称丢弃 PCM 等于停止采集。
+
+Phase 4A-2 验证计划：先复跑 Phase 3 单段前后置/独立 WAV/无音轨视频/蓝牙音乐/取消授权/失败保留；再同一有效模式 A/B/C 检查仅一次授权和一次 getMediaProjection、单个连续 AudioRecord、每段 UUID/帧范围/BOOTTIME 报告独立冻结、双轨完整解码与正确音源、空档内容不进入片段。用可控且各段不同的音源验证切片顺序与边界，主机独立核对帧映射，沿用原生合成文件对照。分别在录制/空闲/定稿时撤权或退出、验证禁止 B 启动及全部资源释放，重新进入确有新授权；验证超时、快速点击、磁盘失败不污染其他片段。增加有界长时/空闲功耗观察；无需重复本阶段高成本声光测试，原同步局限保持。
+
+来源：[播放音频授权与撤权](https://developer.android.com/media/platform/av-capture#how_to_handle_a_mediaprojection_token)、[Android 14+ 单次授权使用与会话释放](https://developer.android.com/media/grow/media-projection#user_consent)、[MediaProjectionManager 前台服务顺序](https://developer.android.com/reference/android/media/projection/MediaProjectionManager)、[AudioRecord 时间戳与读取](https://developer.android.com/reference/android/media/AudioRecord#getTimestamp(android.media.AudioTimestamp,%20int))。屏幕投影文档的单次 VirtualDisplay 规则不等于每个 CameraX 片段必须创建新投影；本方案只在一个仍有效的播放捕获会话内划分文件，纯音频的持续行为仍须设备验证。
+
 ## D013：统一录制会话，保留两路成熟采集实现
 
 查阅日期：2026-10-09；适用 minSdk 29 / compileSdk、targetSdk 36，CameraX 1.6.2。
@@ -145,6 +209,8 @@ Phase 0 Manifest 不声明音频、相机、前台服务或存储权限。Phase 
 ## D008：纯音频投影会话使用 mediaProjection 前台服务
 
 查阅日期：2026-10-09；适用 `minSdk 29 / targetSdk 36`，前台服务专用权限和授权顺序重点适用于 API 34+。
+
+Phase 4A 的 API34+ 请求配置已由 D017 更新；此处授权、前台服务与释放顺序保持不变。
 
 用户点击开始后申请 `RECORD_AUDIO`；成功后打开系统 `createScreenCaptureIntent()` 授权界面。仅在本次授权成功后从页面启动服务；服务先以 `FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION` 进入前台，再调用 `getMediaProjection()`、注册 `onStop()`、构建播放捕获 `AudioRecord`。不调用 `createVirtualDisplay()`，不声明相机、屏幕编码或 microphone 服务类型。每次开始都重新请求投影授权；服务使用 `START_NOT_STICKY`，不保存授权 Intent，不自动重启会话。
 

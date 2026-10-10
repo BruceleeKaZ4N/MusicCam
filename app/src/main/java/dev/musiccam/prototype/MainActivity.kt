@@ -9,6 +9,7 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
 import android.media.MediaPlayer
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
@@ -140,9 +141,14 @@ class MainActivity : Activity() {
     private fun requestProjection() {
         try {
             localMessage = getString(R.string.waiting_projection)
-            PocLog.event(this, "PROJECTION_CONSENT_REQUEST fresh=true")
+            val manager = getSystemService(MediaProjectionManager::class.java)
+            // Keep explicit system consent for each new playback-capture session.
+            val request = if (Build.VERSION.SDK_INT >= 34) {
+                manager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+            } else manager.createScreenCaptureIntent()
+            PocLog.event(this, "PROJECTION_CONSENT_REQUEST fresh=true scope=${if (Build.VERSION.SDK_INT >= 34) "default_display" else "legacy"}")
             @Suppress("DEPRECATION")
-            startActivityForResult(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent(), 2)
+            startActivityForResult(request, 2)
         } catch (e: Exception) {
             pending = false
             reportError("无法打开系统授权", e)

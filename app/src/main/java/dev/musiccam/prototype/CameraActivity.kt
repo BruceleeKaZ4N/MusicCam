@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.SystemClock
 import android.view.View
@@ -335,8 +336,13 @@ class CameraActivity : ComponentActivity() {
                 projectionPending = true
                 authorization.put("projectionRequestNs", SystemClock.elapsedRealtimeNanos())
                 statusView.setText(R.string.waiting_projection)
-                projectionResult.launch(Intent(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent()))
-                PocLog.event(this, "PHASE3_PROJECTION_REQUEST fresh=true")
+                val manager = getSystemService(MediaProjectionManager::class.java)
+                // This only configures the consent dialog; CameraX remains the video source.
+                val request = if (Build.VERSION.SDK_INT >= 34) {
+                    manager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+                } else manager.createScreenCaptureIntent()
+                projectionResult.launch(request)
+                PocLog.event(this, "PHASE3_PROJECTION_REQUEST fresh=true scope=${if (Build.VERSION.SDK_INT >= 34) "default_display" else "legacy"}")
             } catch (e: Exception) {
                 projectionPending = false
                 combinedPending = false
