@@ -9,6 +9,8 @@ import android.net.Uri
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.SystemClock
+import android.os.Handler
+import android.os.Looper
 import android.view.View
 import org.json.JSONObject
 import android.os.Build
@@ -42,8 +44,25 @@ import java.util.UUID
 
 /** Both modes keep CameraX as the video owner; the combined controller owns audio and composition. */
 class CameraActivity : ComponentActivity() {
-    companion object { const val EXTRA_COMBINED = "combined" }
-    private val combined get() = intent.getBooleanExtra(EXTRA_COMBINED, false)
+    companion object {
+        const val EXTRA_COMBINED = "combined"
+        const val EXTRA_MUSIC_MODE = "music_mode"
+    }
+    private val music get() = intent.getBooleanExtra(EXTRA_MUSIC_MODE, false)
+    private val combined get() = music || intent.getBooleanExtra(EXTRA_COMBINED, false)
+    private var ownedModeId: String? = null
+    private var enterModeButton: Button? = null
+    private var endModeButton: Button? = null
+    private var modeView: TextView? = null
+    private val main = Handler(Looper.getMainLooper())
+    private val modeRefresh = object : Runnable {
+        override fun run() {
+            val mode = PlaybackCaptureService.mode
+            modeView?.text = if (ownedModeId == null) "音乐模式未开启：请先进入并完成系统授权。" else mode.message
+            renderControls()
+            if (isResumed()) main.postDelayed(this, 500)
+        }
+    }
     private var combinedPending = false
     private var combinedPermissionsPending = false
     private var projectionPending = false
@@ -93,6 +112,7 @@ class CameraActivity : ComponentActivity() {
     private var permissionPending = false
     private var preview: Preview? = null
     private var capture: VideoCapture<Recorder>? = null
+    private var previewOwner: MusicCameraSession? = null
     private var recording: Recording? = null
     private var finalizing = false
     private var stopping = false
@@ -118,6 +138,7 @@ class CameraActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (music && PlaybackCaptureService.mode.active) ownedModeId = PlaybackCaptureService.mode.id
         lens = savedInstanceState?.getInt("lens") ?: CameraSelector.LENS_FACING_BACK
         combinedPending = savedInstanceState?.getBoolean("combinedPending") ?: false
         combinedPermissionsPending = savedInstanceState?.getBoolean("combinedPermissionsPending") ?: false
@@ -131,7 +152,7 @@ class CameraActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(spacing, spacing, spacing, spacing)
         }
-        content.addView(TextView(this).apply { setText(if (combined) R.string.combined_intro else R.string.camera_intro); textSize = 16f })
+        content.addView(TextView(this).apply { setText(if (music) R.string.music_intro else if (combined) R.string.combined_intro else R.string.camera_intro); textSize = 16f })
         syncView = TextView(this).apply { visibility = View.GONE }
         content.addView(syncView, LinearLayout.LayoutParams(-1, (64 * resources.displayMetrics.density).toInt()))
         previewView = PreviewView(this).apply {
@@ -142,6 +163,18 @@ class CameraActivity : ComponentActivity() {
         val details = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         statusView = TextView(this).apply { text = "点击授权摄像头以开始预览。" }
         details.addView(statusView)
+        if (music) {
+            modeView = TextView(this).also { details.addView(it) }
+            val modeControls = LinearLayout(this)
+            enterModeButton = button(modeControls, R.string.music_enter) { beginCombined() }
+            endModeButton = button(modeControls, R.string.music_end) {
+                PlaybackCaptureService.endMusicMode("用户结束音乐模式", ownedModeId)
+                renderControls()
+            }
+            for (index in 0 until modeControls.childCount)
+                modeControls.getChildAt(index).layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+            details.addView(modeControls)
+        }
         permissionButton = button(details, R.string.camera_permission) {
             if (hasCameraPermission()) bindCamera() else {
                 permissionPending = true
@@ -151,7 +184,7 @@ class CameraActivity : ComponentActivity() {
         }
         val controls = LinearLayout(this)
         startButton = button(controls, if (combined) R.string.combined_start else R.string.camera_start) {
-            if (combined) beginCombined() else startRecording()
+            if (music) startMusicClip() else if (combined) beginCombined() else startRecording()
         }
         stopButton = button(controls, if (combined) R.string.combined_stop else R.string.camera_stop) { stopRecording("用户停止") }
         switchButton = button(controls, R.string.camera_switch) {
@@ -262,9 +295,6 @@ class CameraActivity : ComponentActivity() {
                     val video = builder.build()
                     val viewfinder = Preview.Builder().build()
                     viewfinder.setSurfaceProvider(previewView.surfaceProvider)
-                    val camera = cameras.bindToLifecycle(this, selector, viewfinder, video)
-                    preview = viewfinder
-                    capture = video
                     val qualityName = when (quality) {
                         Quality.FHD -> "1080p"
                         Quality.HD -> "720p"
@@ -276,6 +306,12 @@ class CameraActivity : ComponentActivity() {
                         if (it.lower == it.upper) "目标 ${it.upper}fps" else "目标 ${it.lower}–${it.upper}fps"
                     } ?: "设备默认帧率"
                     configuration = "${lensName()} · $qualityName · $frameRateName"
+                    val camera = if (music) {
+                        val owner = MusicCameraSession()
+                        owner.bind(cameras, viewfinder, video, lens, configuration).also { previewOwner = owner }
+                    } else cameras.bindToLifecycle(this, selector, viewfinder, video)
+                    preview = viewfinder
+                    capture = video
                     ready = true
                     statusView.text = "预览已绑定：$configuration\n实际分辨率和帧率以输出文件为准。"
                     observedCamera = camera.cameraInfo
@@ -284,6 +320,7 @@ class CameraActivity : ComponentActivity() {
                             ready = false
                             if (combined) CombinedSessionController.active?.abort("摄像头异常 code=" + error.code)
                             else stopRecording("摄像头异常")
+                            if (music) PlaybackCaptureService.endMusicMode("摄像头异常", ownedModeId)
                             statusView.text = "摄像头不可用：code=${error.code}；请停止后重试预览。"
                             PocLog.event(this, "PHASE2_CAMERA_ERROR code=${error.code}")
                             renderControls()
@@ -304,7 +341,8 @@ class CameraActivity : ComponentActivity() {
     }
 
     private fun beginCombined() {
-        if (busy() || !isResumed() || PlaybackCaptureService.status.active) return
+        if (busy() || !isResumed() || PlaybackCaptureService.status.active ||
+            PlaybackCaptureService.mode.active || PlaybackCaptureService.mode.stopping) return
         combinedPending = true
         buttonNs = SystemClock.elapsedRealtimeNanos()
         authorization = JSONObject()
@@ -354,8 +392,11 @@ class CameraActivity : ComponentActivity() {
             try {
                 val video = capture ?: error("摄像头未就绪")
                 video.targetRotation = previewView.display?.rotation ?: Surface.ROTATION_0
-                CombinedSessionController.start(this, video, freshConsent, buttonNs, authorization, configuration)
-                attachCombined()
+                if (music) ownedModeId = PlaybackCaptureService.startMusicMode(this, freshConsent)
+                else {
+                    CombinedSessionController.start(this, video, freshConsent, buttonNs, authorization, configuration)
+                    attachCombined()
+                }
             } catch (e: Exception) { reportError("无法启动统一录制；请重新授权", e) }
         }
         renderControls()
@@ -372,8 +413,27 @@ class CameraActivity : ComponentActivity() {
             if (active.canStop && isResumed()) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             renderResult()
+            if (music && isResumed() && active.state in listOf(CombinedSessionController.State.DONE,
+                    CombinedSessionController.State.FAILED)) bindCamera()
         }
         active?.listener?.invoke()
+    }
+
+    private fun startMusicClip() {
+        if (busy() || !isResumed() || !ready) return
+        val modeId = ownedModeId ?: return
+        try {
+            val video = capture ?: error("摄像头未就绪")
+            video.targetRotation = previewView.display?.rotation ?: Surface.ROTATION_0
+            PlaybackCaptureService.adoptMusicCamera(modeId, previewOwner ?: error("预览生命周期未就绪"))
+            CombinedSessionController.startMusicClip(this, video, modeId, SystemClock.elapsedRealtimeNanos(), configuration)
+            attachCombined()
+        } catch (e: Exception) {
+            PlaybackCaptureService.endMusicMode("片段启动异常", modeId)
+            if (CombinedSessionController.active == null) PlaybackCaptureService.releaseMusicCamera(modeId)
+            reportError("无法启动片段", e)
+        }
+        renderControls()
     }
 
     private fun stopProbe() {
@@ -499,8 +559,12 @@ class CameraActivity : ComponentActivity() {
     }
 
     private fun renderControls() {
+        val mode = PlaybackCaptureService.mode
         startButton.isEnabled = !busy() && isResumed() &&
-            if (combined) !PlaybackCaptureService.status.active else ready && hasCameraPermission()
+            if (music) ready && mode.id == ownedModeId && mode.ready && !mode.stopping
+            else if (combined) !PlaybackCaptureService.status.active && !mode.active && !mode.stopping else ready && hasCameraPermission()
+        enterModeButton?.isEnabled = !busy() && isResumed() && !mode.active && !mode.stopping && !PlaybackCaptureService.status.active
+        endModeButton?.isEnabled = ownedModeId == mode.id && mode.active && !mode.stopping
         if (combined) {
             stopButton.isEnabled = CombinedSessionController.active?.canStop == true
             retryButton?.isEnabled = !busy() && !PlaybackCaptureService.status.active &&
@@ -538,8 +602,12 @@ class CameraActivity : ComponentActivity() {
     private fun unbindCamera() {
         observedCamera?.cameraState?.removeObservers(this)
         observedCamera = null
-        preview?.let { provider?.unbind(it) }
-        capture?.let { provider?.unbind(it) }
+        if (!PlaybackCaptureService.ownsMusicCamera(capture)) {
+            previewOwner?.destroy()
+            preview?.let { provider?.unbind(it) }
+            capture?.let { provider?.unbind(it) }
+        }
+        previewOwner = null
         preview = null
         capture = null
         ready = false
@@ -548,16 +616,49 @@ class CameraActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         resumed = true
-        if (!hasCameraPermission()) { ready = false; unbindCamera() }
-        else if (CombinedSessionController.active == null && recording == null && !finalizing) bindCamera()
+        if (music && PlaybackCaptureService.mode.active) ownedModeId = PlaybackCaptureService.mode.id
+        if (music) PlaybackCaptureService.setMusicUiVisible(ownedModeId, true)
+        val serviceCamera = if (music) PlaybackCaptureService.musicCamera() else null
+        if (serviceCamera != null) {
+            val reusePreview = preview === serviceCamera.preview
+            provider = serviceCamera.provider
+            preview = serviceCamera.preview
+            capture = serviceCamera.video
+            lens = serviceCamera.lens
+            configuration = serviceCamera.configuration
+            ready = true
+            // Even the same provider triggers a CameraX pipeline reset. A temporary pause
+            // retains this view's provider; only a newly created page needs to replace it.
+            if (!reusePreview) serviceCamera.preview.setSurfaceProvider(previewView.surfaceProvider)
+            PocLog.event(this, "MUSIC_UI_FOREGROUND mode=$ownedModeId preview=${if (reusePreview) "reused" else "replaced"}")
+        }
+        if (!hasCameraPermission()) {
+            if (music) PlaybackCaptureService.endMusicMode("摄像头权限已撤回", ownedModeId)
+            ready = false; unbindCamera()
+        }
+        else if (serviceCamera == null && CombinedSessionController.active == null && recording == null && !finalizing) bindCamera()
         attachCombined()
         continueCombinedStart()
         renderResult()
+        if (music) main.post(modeRefresh)
     }
 
     override fun onPause() {
         resumed = false
-        stopRecording(if (isChangingConfigurations) "页面配置变化" else "离开录像页面")
+        if (music) PlaybackCaptureService.setMusicUiVisible(ownedModeId, false)
+        main.removeCallbacks(modeRefresh)
+        stopProbe()
+        if (!music || isFinishing || isChangingConfigurations || !PlaybackCaptureService.backgroundNoticeVisible()) {
+            if (music) PlaybackCaptureService.endMusicMode(
+                if (isFinishing || isChangingConfigurations) "退出音乐页面" else "通知未开启，禁止后台捕获", ownedModeId)
+            stopRecording(if (isChangingConfigurations) "页面配置变化" else "离开录像页面")
+        } else {
+            // PreviewView COMPATIBLE retains a SurfaceTexture while CameraX still uses it.
+            // Leave the provider attached across Home/app switching; detach on destruction.
+            PocLog.event(this, "MUSIC_UI_BACKGROUND mode=$ownedModeId capture_continues=true")
+        }
+        // A custom preview lifecycle must not keep an idle camera running behind the page.
+        if (music && !PlaybackCaptureService.ownsMusicCamera(capture)) unbindCamera()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onPause()
     }
@@ -573,10 +674,14 @@ class CameraActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        main.removeCallbacks(modeRefresh)
+        if (music && (isFinishing || isChangingConfigurations))
+            PlaybackCaptureService.endMusicMode("音乐页面销毁", ownedModeId)
         consent = null
         attachedController?.listener = null
         stopProbe()
-        stopRecording("录像页面销毁")
+        if (!music || isFinishing || isChangingConfigurations) stopRecording("录像页面销毁")
+        if (PlaybackCaptureService.ownsMusicCamera(capture)) preview?.setSurfaceProvider(null)
         unbindCamera()
         preferences.unregisterOnSharedPreferenceChangeListener(resultsListener)
         super.onDestroy()

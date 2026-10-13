@@ -8,15 +8,15 @@
 
 源码核实有两处请求：CameraActivity.continueCombinedStart()（合成录像）和 MainActivity.requestProjection()（独立音频）。两处均在 SDK_INT >= 34 时调用 MediaProjectionConfig.createConfigForDefaultDisplay()，再调用 MediaProjectionManager.createScreenCaptureIntent(config)；API 29–33 保留无参数版本。就地加版本分支，不引入新授权模块或依赖；日志只增加请求范围 default_display/legacy，不记录授权内容，也不声称该日志证明厂商弹窗实际范围。
 
-官方预期为仅请求默认显示屏、免去单应用范围选择；API 与配置均从 34 提供，无参数版本等价于用户选择配置。系统仍提示用户同意，厂商可覆盖退出单应用共享的配置，实际 UI 必须另行观察。不使用自动点击授权、隐藏 API 或特殊权限，不创建 VirtualDisplay，不改变 CameraX、AudioRecord、合成、BOOTTIME 和释放路径。每次录制仍是一轮新授权；这项改动不实现连续拍摄。
+官方预期为仅请求默认显示屏、免去单应用范围选择；API 与配置均从 34 提供，无参数版本等价于用户选择配置。系统仍提示用户同意，厂商可覆盖退出单应用共享的配置，实际 UI 必须另行观察。不使用自动点击授权、隐藏 API 或特殊权限，不创建 VirtualDisplay，不改变 CameraX、AudioRecord、合成、BOOTTIME 和释放路径。Phase 4A 当时每次录制仍是一轮新授权；Phase 4A-2 音乐模式内的连续片段见 D018/D019，每次新音乐模式仍须新授权。
 
 来源：[MediaProjectionConfig](https://developer.android.com/reference/android/media/projection/MediaProjectionConfig#createConfigForDefaultDisplay())、[MediaProjectionManager 授权请求](https://developer.android.com/reference/android/media/projection/MediaProjectionManager#createScreenCaptureIntent(android.media.projection.MediaProjectionConfig))、[单应用共享退出与厂商覆盖](https://developer.android.com/media/grow/media-projection#opt_out)。构建和本次 vivo 实际行为见 STATUS.md Phase 4A。
 
 本次设备观察：vivo V2527A / Android16 / API36 / PD2527C_A_16.0.19.3.W10，合成入口弹窗范围显示「共享整个屏幕」、范围项灰色，展开提示「MusicCam 已停用此选项」，仍有系统「开始」按钮。此设备遵循请求配置，无需手动切换范围；不能由一台设备推广到其他厂商或系统版本。
 
-## D018：一次有效授权支持多段相机视频的可行性（仅分析，未实施）
+## D018：一次有效授权支持多段相机视频（Phase 4A-2 已实施，核心验收通过）
 
-查阅日期：2026-10-09～10；评估 API 29–36，Android 14–16 / targetSdk 36 的生命周期约束。以下是基于源码和官方 API 的设计推论，连续拍摄尚无设备验证，实施暂停至维护者决定 Phase 4A-2。
+查阅日期：2026-10-09～10；评估 API 29–36，Android 14–16 / targetSdk 36 的生命周期约束。以下原分析在 Phase 4A 完成；维护者于 2026-10-10 明确批准按此方案实施 Phase 4A-2。实现差异与边界见 D019，实际验收见 STATUS.md。
 
 ### 当前调用链与耦合
 
@@ -65,6 +65,58 @@ onStop() 或读错时立即将模式标为不可用，阻止新片段、废弃�
 Phase 4A-2 验证计划：先复跑 Phase 3 单段前后置/独立 WAV/无音轨视频/蓝牙音乐/取消授权/失败保留；再同一有效模式 A/B/C 检查仅一次授权和一次 getMediaProjection、单个连续 AudioRecord、每段 UUID/帧范围/BOOTTIME 报告独立冻结、双轨完整解码与正确音源、空档内容不进入片段。用可控且各段不同的音源验证切片顺序与边界，主机独立核对帧映射，沿用原生合成文件对照。分别在录制/空闲/定稿时撤权或退出、验证禁止 B 启动及全部资源释放，重新进入确有新授权；验证超时、快速点击、磁盘失败不污染其他片段。增加有界长时/空闲功耗观察；无需重复本阶段高成本声光测试，原同步局限保持。
 
 来源：[播放音频授权与撤权](https://developer.android.com/media/platform/av-capture#how_to_handle_a_mediaprojection_token)、[Android 14+ 单次授权使用与会话释放](https://developer.android.com/media/grow/media-projection#user_consent)、[MediaProjectionManager 前台服务顺序](https://developer.android.com/reference/android/media/projection/MediaProjectionManager)、[AudioRecord 时间戳与读取](https://developer.android.com/reference/android/media/AudioRecord#getTimestamp(android.media.AudioTimestamp,%20int))。屏幕投影文档的单次 VirtualDisplay 规则不等于每个 CameraX 片段必须创建新投影；本方案只在一个仍有效的播放捕获会话内划分文件，纯音频的持续行为仍须设备验证。
+
+## D019：Phase 4A-2 的模式与片段协议
+
+查阅/实施日期：2026-10-10；API 29–36，minSdk 29 / compileSdk、targetSdk 36，CameraX 1.6.2 不变。延续 D017 的默认显示屏请求，保留系统确认；不创建 VirtualDisplay。
+
+主页面新增音乐模式入口；相机页先“进入音乐模式”完成一次新授权，服务一次 getMediaProjection、注册 Callback 并启动一个连续 AudioRecord。每段 startMusicClip 创建 UUID，音频线程在排空已读间隔缓冲后的完整帧边界打开 WAV，回执后才启动 CameraX。停止按钮只停止本段 CameraX；Finalize 后关闭该 WAV 并冻结报告，控制器再调用原合成/发布管线。PREPARING/STOPPING/MERGING 时禁止下一段；普通单段自动合成和独立 WAV/视频入口保留。授权 Intent 只移交一次并从服务启动 Intent 移除，不存入 Bundle/JSON/偏好；START_NOT_STICKY 不重启采集。
+
+MusicPcmSession 为音频线程私有的片段写入器，全局已读帧包含丢弃的间隔；各段报告保存模式 UUID、[S,E)、本段 frames、局部首非零帧和原始全局 AudioTimestamp 锚点。起点沿用 D018 的 T-(F-S)×10^9/48000；普通单段 S=0，算法保持。服务每秒获取 BOOTTIME 锚点，仅沿用获取后 1.5 秒内的附近有效锚点；一段始终没有有效附近锚点时保留带标记的 first-read 近似 fallback。关闭之后不再改写该段报告。检查完整立体声帧、游标/写入长度、时间戳回退、与初始时间戳差值显著变化（容忍 2 个 AudioRecord 缓冲加 100ms）；异常终止模式、保留文件。公开 AudioRecord API 没有每次 read 的精确起始帧号，这些检查不能保证检测所有小幅丢帧，长时漂移仍待验证。
+
+模式结束、通知停止、页面 onPause/onDestroy、配置变化、任务移除、ACTION_SCREEN_OFF、授权 onStop 或读错时立即禁止新片段并通知控制器停止相机；PCM 工作线程定稿/释放 AudioRecord 后，主线程注销回调、stop projection、移除通知、stopSelf。系统撤权给当前音频报告记错并保留；已定稿的离线合成可继续。录制状态等待启动最多 10 秒、定稿 20 秒（音频回执最终等待 30 秒），失败不把未定稿文件冒充成功。强杀不保证定稿，留下原始文件和未完成标记，后续只允许文件重试。此初版离开即结束行为已按用户最新需求由 D020 更新；独立音频原有行为保持。
+
+第一版空闲超时 3 分钟（AudioRecord 就绪或片段关闭起算，合成期间也计时）；单段上限 10 分钟，音乐模式上限 30 分钟。页面与前台通知明确持续捕获及结束入口；间隔仍实际捕获/读 PCM，丢弃不会省去 AudioRecord 的电量开销。锁屏主动结束，不依赖厂商是否发 onStop。超时后必须再次手动进入并完成新授权，不后台恢复。
+
+实际文件调整比 D018 多出 MusicPcmSession.kt，便于用真实文件写入器验证片段边界；SessionStorage.kt 无需修改，模式/区间直接写现有每 UUID 的 session.json 和 audio-timing.json，原子写入/发布/清理契约兼容。AudioVideoComposer、AudioAlignment、WavFile 和 MediaCodec/Extractor/Muxer 管线未改。debug 增加 MusicPcmCheck 与已有框架 Instrumentation 的 music_pcm 分支，无新增依赖/权限；Release 无测试入口。
+
+限制：recoverableId 仍只展示最近一个未完成会话，旧失败 UUID 原始文件不会被下一段清理，但没有失败列表 UI；D020 更新后可以切换音乐 App；外部回放可能改变音源或音频焦点，验收应先录完 A/B/C 再回放。3 分钟/10 分钟/30 分钟限制不等于已实测长期功耗/热量；设备和回归结果逐项见 STATUS.md，不宣称精准同步或修复 Phase 3 局部约 100ms 偏差。
+
+官方依据：[播放捕获与 onStop 释放](https://developer.android.com/media/platform/av-capture#how_to_handle_a_mediaprojection_token)、[Android 14 单次授权约束](https://developer.android.com/about/versions/14/behavior-changes-14#media-projection)、[MediaProjection 会话释放](https://developer.android.com/media/grow/media-projection#resource-recovery)、[AudioRecord getTimestamp 与 stop/start 帧计数重置](https://developer.android.com/reference/android/media/AudioRecord#getTimestamp(android.media.AudioTimestamp,%20int))、[AudioTimestamp 最佳估计与 BOOTTIME](https://developer.android.com/reference/android/media/AudioTimestamp)。配置预期、编译验证、实际厂商行为分别记录。
+
+## D020：按维护者最新需求允许有明确通知的后台录像
+
+2026-10-10（API 29–36 / targetSdk 36）：首轮真机用户反馈切到音乐 App 会使模式结束，进一步明确希望后台视频也继续拍摄。本轮据此修订 D018/D019 的“离开页面即结束”约束；保留锁屏/退出/撤权/超时结束，以及不跨重启免授权。
+
+CameraActivity.onPause 单靠删除 stop 调用无法保持录像，CameraX 仍绑定 Activity 生命周期。因此新增 MusicCameraSession，用已有 LifecycleRegistry 实现服务持有的 LifecycleOwner；初版仅音乐片段开始时把同一 Preview/VideoCapture 从 Activity 转交服务；后按 D022 改为音乐页预览即使用同一自定义 owner、开始时只交接所有权，以避免重复绑定。Recorder 和原生合成算法不变。从可见页面开始录像前，先提升已运行前台服务的类型至 mediaProjection|camera（camera 类型 API30+；API29 保留 mediaProjection），再绑定和录制。Manifest 增加相关公开 FOREGROUND_SERVICE_CAMERA 正常权限及 camera 类型，无新运行时权限类别、依赖/SDK 升级、后台自动启动或麦克风降级。
+
+Home/切换应用时视频/PCM 继续；预览连接初版每次断开/恢复，2026-10-11 按 D021 改为同一页面短暂切后台时保留，页面销毁才断开。返回或点击通知恢复同一个相机片段的预览。CameraX Finalize 后解绑本段服务相机并降回纯 mediaProjection，下一段仍只从可见页面启动。音乐模式在空档可保留前台音频，仍只读/丢弃 PCM；Activity 后台销毁不应解绑服务拥有的录像。显式返回/退出页面、配置变化、任务划除、锁屏、用户结束、系统撤权和超时结束模式。音频已关闭后服务最多等待相机定稿 20 秒再彻底移除前台服务，避免先销毁服务相机生命周期造成正常停止失败。
+
+通知分别显示持续音频/摄像头与系统音频录制，提供“停止本段并合成”“结束音乐模式”，动作带模式/片段 ID 防陈旧命令。必须有应用通知权限且 capture 通知频道可见，才允许后台保留；通知关闭时 onPause 或后台每秒检查结束模式。没有通知权限仍可前台验证，但明确提示切换应用会结束，不申请忽略电池优化、悬浮窗、Root 或隐藏保活能力。系统仍可能杀进程或撤权，不能承诺永久常驻、锁屏录像或后台自动恢复。
+
+依据（查阅 2026-10-10）：[camera/mediaProjection 前台服务类型与 while-in-use 权限](https://developer.android.com/develop/background-work/services/fgs/service-types)、[从后台启动服务限制](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start)、[CameraX 自定义 LifecycleOwner 与解绑责任](https://developer.android.com/media/camera/camerax/architecture#custom_lifecycleowners)、[通知权限](https://developer.android.com/develop/ui/views/notifications/notification-permission)。文档允许的方向不等于 vivo 已通过；实际后台画面/音轨持续、通知停止及生命周期结果见 STATUS.md。
+
+## D021：暂时切后台保留同一页面的预览连接
+
+2026-10-11；API 29–36 / targetSdk 36 / CameraX 1.6.2。用户确认后台录像继续，但返回页面预览短暂黑屏、最终 MP4 画面停顿，要求只做小改动，较大调整后置。
+
+核对 Google Maven 正式 1.6.2 Preview.java：setSurfaceProvider(null) 会使 Preview inactive；再次设置非空 provider（即便相同）在已绑定分辨率时调用 updateConfigAndOutput / notifyReset，重建预览管线。TextureViewImplementation.java 会在相机仍使用 SurfaceTexture 时保留它，并在可用时重新连接。此源码支持避免应用主动重复配置，但不能证明所有 vivo 返回停顿都由此引起。
+
+CameraActivity 在音乐模式短暂 onPause 时保留当前 provider，onResume 仅在新页面接管不同 Preview 时设置新 provider；同一页面恢复不重复设置，增加 reused/replaced 诊断日志。真正 onDestroy 仍断开服务相机的页面 provider，片段结束仍完整解绑。保持原 COMPATIBLE 预览、服务相机生命周期、AudioRecord、同步和合成管线，不使用隐藏 API/测试专用 getter，不引入离屏渲染。页面重建或厂商驱动重新配置仍可能停顿；更大改造暂后置。构建和实际改善分别记录于 STATUS.md；用户已确认本机返回停顿解决。
+
+来源：[公开 Preview.setSurfaceProvider](https://developer.android.com/reference/androidx/camera/core/Preview#setSurfaceProvider(androidx.camera.core.Preview.SurfaceProvider))、[CameraX 1.6.2 正式 core 源码包](https://dl.google.com/dl/android/maven2/androidx/camera/camera-core/1.6.2/camera-core-1.6.2-sources.jar)、[正式 view 源码包](https://dl.google.com/dl/android/maven2/androidx/camera/camera-view/1.6.2/camera-view-1.6.2-sources.jar)。源码仅在忽略目录，本次只读取，不升级依赖。
+
+## D022：音乐模式开始片段时接管已有相机绑定
+
+查阅/实现：2026-10-11；记录补齐：2026-10-13。API 29–36 / targetSdk 36 / CameraX 1.6.2。维护者已确认 D021 返回页面停顿解决，进一步报告点击开始时先黑屏卡顿；仍按小范围体验优化处理。
+
+实际原因之一是 D020 每段在开始按钮路径把 Preview/VideoCapture 从 Activity 解绑再绑定到服务的 MusicCameraSession，必然引入相机生命周期切换。音乐页面改为从预览建立时就使用现有 MusicCameraSession 的自定义生命周期；页面可见时自行持有它，录制开始先提升相关 camera 前台服务类型，再将同一个 owner/现有 binding 交给服务持有。adoptMusicCamera 不调用 unbind/bind，不换 Preview、Recorder 或预览 Surface，不改变 CameraX 录像和原生合成算法；错误处理改由服务接管，不保留 Activity 错误处理闭包。日志标记 binding=reused。
+
+仅音乐页面适用；独立摄像头和原单段合成仍绑定 Activity 并在离开时停止。音乐页面空闲/未授权时 onPause 必须显式销毁自管 owner、解绑相机，不能因自定义生命周期继续在后台预览。录制时服务接管后，页面暂停/销毁不释放服务拥有的录像；片段 Finalize、模式结束和服务销毁仍沿用有界释放。下一段先恢复新的可见预览，再接管已有绑定。无新增权限/依赖、离屏渲染或 SDK/Gradle 变更。
+
+这是减少一次已知重绑，不保证消除厂商驱动或编码器所有启动延迟。构建/Lint 已通过；首轮手机拒绝安装，2026-10-13用户允许后安装成功并核实APK一致。2026-10-13用户已确认“问题解决了，我觉得这阶段完成了”；最新实际短片检查与模式释放记录通过，上一已验证APK仍保留在忽略目录以便回退。实际结果见 STATUS.md。
+
+依据：[CameraX 自定义 LifecycleOwner、显式释放与并发绑定](https://developer.android.com/media/camera/camerax/architecture#custom_lifecycleowners)、[ProcessCameraProvider.bindToLifecycle](https://developer.android.com/reference/androidx/camera/lifecycle/ProcessCameraProvider)。生命周期所有者实例保持相同，调整的是应用持有它的对象；不使用库内部或隐藏 API。
 
 ## D013：统一录制会话，保留两路成熟采集实现
 

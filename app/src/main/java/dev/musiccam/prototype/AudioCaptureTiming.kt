@@ -8,7 +8,8 @@ import org.json.JSONObject
 import java.io.File
 
 /** BOOTTIME anchors describe PCM frame zero, including leading zero-valued PCM. */
-class AudioCaptureTiming(private val file: File) {
+class AudioCaptureTiming(private val file: File, private val startFrame: Long = 0,
+                         private val modeId: String? = null) {
     private val report = JSONObject().put("clock", "elapsedRealtimeNanos/TIMEBASE_BOOTTIME")
     private val anchors = ArrayList<Pair<Long, Long>>()
     private var nextPollNs = 0L
@@ -25,8 +26,27 @@ class AudioCaptureTiming(private val file: File) {
         SessionStorage.writeJson(file, report)
     }
 
+    fun segmentOpened(captureStartedNs: Long) {
+        startedNs = SystemClock.elapsedRealtimeNanos()
+        report.put("musicModeId", modeId).put("startFrameInclusive", startFrame)
+            .put("segmentOpenedNs", startedNs).put("continuousCaptureStartedNs", captureStartedNs)
+        SessionStorage.writeJson(file, report)
+    }
+
     fun pcm(record: AudioRecord, samples: ShortArray, count: Int, framesBefore: Long, readReturnedNs: Long) {
+        observePcm(samples, count, framesBefore, readReturnedNs)
         val now = readReturnedNs
+        if (now < nextPollNs) return
+        val timestamp = AudioTimestamp()
+        val code = record.getTimestamp(timestamp, AudioTimestamp.TIMEBASE_BOOTTIME)
+        report.put("lastTimestampResult", code).put("bufferSizeInFrames", record.bufferSizeInFrames)
+        if (code == AudioRecord.SUCCESS && timestamp.nanoTime > 0 && timestamp.framePosition >= 0) {
+            observeTimestamp(timestamp.framePosition, timestamp.nanoTime)
+            nextPollNs = now + 1_000_000_000L
+        } else nextPollNs = now + 100_000_000L
+    }
+
+    internal fun observePcm(samples: ShortArray, count: Int, framesBefore: Long, now: Long) {
         if (firstReadNs == 0L) {
             firstReadNs = now
             firstReadFrames = count.toLong() / PlaybackCaptureService.CHANNELS
@@ -39,21 +59,15 @@ class AudioCaptureTiming(private val file: File) {
                 report.put("firstNonZeroReceivedNs", now).put("firstNonZeroFrame", firstNonZeroFrame)
             }
         }
-        if (now < nextPollNs) return
-        val timestamp = AudioTimestamp()
-        val code = record.getTimestamp(timestamp, AudioTimestamp.TIMEBASE_BOOTTIME)
-        report.put("lastTimestampResult", code).put("bufferSizeInFrames", record.bufferSizeInFrames)
-        if (code == AudioRecord.SUCCESS && timestamp.nanoTime > 0 && timestamp.framePosition >= 0) {
-            if (anchors.lastOrNull()?.first != timestamp.framePosition && anchors.size < 3600) {
-                anchors.add(timestamp.framePosition to timestamp.nanoTime)
-            }
-            nextPollNs = now + 1_000_000_000L
-        } else nextPollNs = now + 100_000_000L
+    }
+
+    internal fun observeTimestamp(frame: Long, timeNs: Long) {
+        if (anchors.lastOrNull()?.first != frame && anchors.size < 3600) anchors.add(frame to timeNs)
     }
 
     fun finish(frames: Long, nonZero: Long, failure: String?) {
         val rate = PlaybackCaptureService.SAMPLE_RATE
-        val origins = anchors.map { (frame, time) -> time - frame * 1_000_000_000L / rate }.sorted()
+        val origins = anchors.map { (frame, time) -> time - (frame - startFrame) * 1_000_000_000L / rate }.sorted()
         val origin = if (origins.isNotEmpty()) origins[origins.size / 2] else
             firstReadNs - firstReadFrames * 1_000_000_000L / rate
         val rawAnchors = JSONArray()
@@ -64,6 +78,8 @@ class AudioCaptureTiming(private val file: File) {
             .put("firstNonZeroFrame", firstNonZeroFrame).put("frames", frames).put("nonZeroSamples", nonZero)
             .put("stopCompletedNs", SystemClock.elapsedRealtimeNanos()).put("complete", true)
             .put("error", failure ?: JSONObject.NULL)
+        if (modeId != null) report.put("endFrameExclusive", startFrame + frames)
+            .put("anchorFramePositions", "continuous_AudioRecord_global_frames")
         if (anchors.size > 1) {
             val first = anchors.first()
             val last = anchors.last()

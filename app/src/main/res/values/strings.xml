@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="open_music_mode">音乐拍摄模式（一次授权连续拍摄）</string>
+    <string name="music_intro">授权后点“开始音视频录制”。有明确通知时，切换应用继续录像和内录；返回或从通知停止。锁屏、退出结束模式。空闲 3 分钟、单段 10 分钟、模式 30 分钟设有上限。</string>
+    <string name="music_enter">进入音乐模式</string>
+    <string name="music_end">结束音乐模式</string>
     <string name="app_name">MusicCam</string>
     <string name="open_combined">摄像头 + 系统音频自动合成</string>
     <string name="combined_intro">MusicCam · 音视频合成 PoC\n点击开始并完成本次系统授权，同时录制摄像头与允许捕获的播放音频；停止后自动生成 MP4。无麦克风。离开此页会停止并合成。</string>

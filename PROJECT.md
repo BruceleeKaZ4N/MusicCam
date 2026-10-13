@@ -21,16 +21,17 @@ MusicCam 是一个计划在 GitHub 开源的 Android 相机应用。目标是让
 | Phase 1 | 单独验证 AudioPlaybackCapture，最小开始/停止与状态展示 | 授权、PCM 数据与可回放文件、允许/拒绝捕获音源对照、撤权释放、耳机路由实测 |
 | Phase 2 | CameraX 独立摄像头预览、前后切换与无音轨 MP4 录像 | 真机画面、文件播放、时长、零音轨、音频模块回归、蓝牙音乐连续性 |
 | Phase 3 | 单次启动两路采集，录后原生 AAC 编码与 H.264/AAC MP4 合成 | 最小原型完成，回归通过；局部同步估计及测量歧义见 STATUS.md |
-| Phase 4A（当前） | API 34+ 默认显示屏授权请求优化；一次授权连续拍摄的架构分析 | 已完成：构建/Lint、vivo 弹窗/取消授权、后置短片合成与独立音频回归；连续拍摄等待 Phase 4A-2 决定 |
+| Phase 4A | API 34+ 默认显示屏授权请求优化；一次授权连续拍摄的架构分析 | 已完成：构建/Lint、vivo 弹窗/取消授权、后置短片合成与独立音频回归；连续拍摄分析获准进入 Phase 4A-2 |
+| Phase 4A-2（已完成） | 一次有效授权的音乐模式；连续 AudioRecord、独立片段、串行合成及可见生命周期 | 核心验收通过：构建/Lint、同模式独立多段、后台录像/音频、开始/返回停顿修正和释放；维护者2026-10-13确认完成，覆盖边界见STATUS.md |
 | 后续 | 同步改进、兼容性与产品 UI、开源准备 | 长时与多路由验证、许可证与发布资料 |
 
 Phase 0 只有启动说明页。Phase 1 已实现 MediaProjection 授权、AudioPlaybackCapture / AudioRecord、mediaProjection 前台服务、WAV 保存与回放，以及自有测试音源；核心真机验收通过，实际结果与未完成异常测试见 STATUS.md。
 
 Phase 2 已完成独立 CameraX 无音轨录像。Phase 3 已在同一相机页增加独立的合成入口：统一控制器启动 CameraX Recorder 与既有 AudioPlaybackCapture，停止并等两路定稿后，将本轮 PCM/WAV 编码为 AAC，再无损复用 H.264 视频到 Movies/MusicCam。原独立音频/视频入口保留。
 
-当前 Phase 4A 仅调整两个播放捕获授权入口：API 34+ 使用 MediaProjectionConfig.createConfigForDefaultDisplay() 与 createScreenCaptureIntent(config)，API 29–33 保留无参数请求。系统弹窗仍由用户确认；不创建 VirtualDisplay，CameraX 仍是视频来源，音频捕获、合成和时间戳逻辑不变。vivo 的实际弹窗及回归结果分别记录在 STATUS.md，不把 API 预期当作设备结论。一次授权连续拍摄仅完成可行性与最小方案分析（DECISIONS.md D018），未实施，等待维护者决定是否进入 Phase 4A-2。本阶段不重复声光测试、不处理既有约 100ms 局部偏差及测量歧义，不做 UI 美化、相册管理、实时封装或多机型适配。
+Phase 4A-2 已实现 D018 并获维护者确认完成：主动进入音乐拍摄模式并完成一次系统授权，模式内持有一个 MediaProjection 与持续 AudioRecord，每段独立 UUID/WAV/BOOTTIME 报告，空档 PCM 读取后直接丢弃。停止本段并完成定稿/合成/保存后才允许下一段；有明确前台通知时允许切换应用继续录像/内录（按维护者最新需求修订 D018，见 D020）；主动结束/退出、锁屏、撤权或异常释放捕获。空闲 3 分钟、单段 10 分钟、模式 30 分钟设有上限；退出或超时后重新进入必须新授权。原独立音频、独立视频和单段合成入口保留；原生合成管线不变。Phase 4A 的 API 34+ 默认显示屏配置继续适用，API 29–33 保留原授权请求。实际验收与尚未覆盖的风险见 STATUS.md，本阶段不重复声光测试、不处理约 100ms 局部偏差及测量歧义，不做相机 UI 美化、实时封装或多机型适配。
 
-使用 BOOTTIME 单调时钟记录会话事件，AudioRecord 时间戳与 CameraX 编码事件估计两路起点；CameraX 正式公开 API 无绝对首帧采集时间戳，因此属于可测量的近似对齐，不宣称精准同步。音频按测得的起点裁剪/补静音，保留开头有效静音，尾部以视频时间线为准；AAC priming 和长时漂移仍须实测。MediaProjection 仅授权播放捕获，不是视频来源。每轮重新由用户授权，不复用历史 WAV。保持 minSdk 29 / compileSdk、targetSdk 36，无新增依赖、网络或存储权限。
+使用 BOOTTIME 单调时钟记录会话事件，AudioRecord 时间戳与 CameraX 编码事件估计两路起点；CameraX 正式公开 API 无绝对首帧采集时间戳，因此属于可测量的近似对齐，不宣称精准同步。音频按测得的起点裁剪/补静音，保留开头有效静音，尾部以视频时间线为准；AAC priming 和长时漂移仍须实测。MediaProjection 仅授权播放捕获，不是视频来源。每次新捕获模式/会话由用户重新授权，有效音乐模式内按片段切分，不复用失效 token 或历史 WAV。保持 minSdk 29 / compileSdk、targetSdk 36，无新增依赖、网络或存储权限；后台录像只增加相关的公开 camera 前台服务声明。
 
 ## 已确认的技术限制
 

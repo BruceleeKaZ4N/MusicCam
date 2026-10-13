@@ -1,6 +1,108 @@
 # MusicCam 当前状态
 
-更新时间：2026-10-10（Asia/Shanghai）。
+更新时间：2026-10-13（Asia/Shanghai）。
+
+## Phase 4A-2：一次授权，连续拍摄（核心验收通过，本阶段完成）
+
+2026-10-13最终验收：用户对最新安装版回复“可以了，问题解决了，我觉得这阶段完成了”。按此确认收尾，不再追加测试。一次有效授权内连续独立MP4、串行合成、后台音乐录像、开始/返回黑屏修正已完成；构建/Lint、PCM边界与原生合成对照、实际MP4双轨检查通过。独立音频与独立摄像头本轮回归结果见下；独立摄像头切后台仍按原设计停止。最新片段78d16d12录制/返回及保存完成，用户结束音乐模式后日志MUSIC_MODE_CLOSED→MUSIC_RESOURCES_RELEASED，最终dumpsys本应用服务=nothing / media_projection=null，`.local/phase4a2/start-preview-release-final.json`。
+
+覆盖边界：系统主动MediaProjection.Callback.onStop撤权、最新版本原单段合成入口手动回归、部分权限/磁盘/强杀异常、10/30分钟上限及长期功耗未逐项实测，留作后续覆盖，不把阶段验收写成所有异常/设备均通过。原Phase 3约100ms局部同步偏差及测量歧义不变，无新补偿、声光测试、SDK/Gradle/依赖升级；未Commit/Push。
+
+2026-10-10：维护者明确批准按 D018 实施。起点 HEAD 为 `6aae4a0`（Phase 4A 授权优化已提交），初始 `git status --short` 干净；本轮不 Commit/Push，不覆盖已有改动。完整检查文档与实际授权/服务/控制器/PCM/存储/合成源码；原同步补偿和合成算法未改。
+
+### 实际修改
+
+- MainActivity/CameraActivity/strings 新增独立“音乐拍摄模式”入口、先进入授权再拍片、结束入口与持续采集说明；原独立音频、独立摄像头和单段自动合成入口保留。
+- PlaybackCaptureService 一次有效模式持有一个 MediaProjection/AudioRecord；片段命令由音频线程串行执行，开始时先排空间隔缓冲，片段外 PCM 只读不存；模式 UUID 与片段 UUID 回执隔离。注册系统撤权及锁屏处理，主动退出/通知停止/异常结束模式；首版后台结束规则随后按用户最新需求由 D020 修订，禁用新片段，释放 AudioRecord、projection、前台服务，不重用授权。
+- 新 MusicPcmSession 逐段独立 WAV/报告；AudioCaptureTiming 按全局 [S,E) 转换局部 BOOTTIME 起点，普通单段 S=0 保持原算法；每段报告冻结。CombinedSessionController 等待本段 WAV 定稿回执，CameraX Finalize 后才关片段音频，再按原算法合成/发布/清理，仅处理该 UUID。
+- 串行录制/合成，快速重复开始/停止受状态限制。空闲 3 分钟、单段 10 分钟、音乐模式 30 分钟上限；启动 10 秒、定稿 20 秒/音频最终等待 30 秒超时保护。系统撤权/读取错误给当前段记错并保留；合成失败沿用原文件保护/重试。recoverableId 仍只展示最近一个未完成会话，旧失败数据保留。
+- debug MusicPcmCheck 和 DeviceMediaInstrumentation 的 music_pcm 分支验证实际写入器，不新增依赖/权限。SessionStorage、AudioVideoComposer、AudioAlignment、WavFile、Gradle/SDK 未改；后续后台录像只新增相关的主 Manifest camera 前台服务声明；D019 记录实际差异与公开 API 连续性检查局限。
+
+### 构建与自动化
+
+已执行（既有工具/缓存，无 SDK 安装）：
+
+```sh
+source .local/env.sh
+./gradlew --offline --no-daemon :app:assembleDebug :app:lintDebug
+adb devices -l
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am instrument -w -e suite music_pcm dev.musiccam.prototype/.DeviceMediaInstrumentation
+python3 tools/check_native_composer.py --output .local/phase4a2/native-checks
+adb shell am start -n dev.musiccam.prototype/.MainActivity
+git diff --check
+```
+
+- 首轮构建 19 秒通过；补充片段检查和保护后构建 16 秒，最后控制器错误定稿路径修正后 15 秒通过。Lint 0 errors / 20 warnings（原 19，加一个相同类型 UseKtx 建议），没有降低 targetSdk、关闭检查或升级工具。
+- 已安装 Debug APK。设备为 vivo V2527A / Android16 / API36（USB 已授权；最初未连接，用户重新连接）。新 PCM 检查 passed：A=[4800,14400)、B=[20200,34600)、C=[41400,60600)，不同间隔标记全部丢弃；WAV 大小/内容、帧数、局部首非零位置、BOOTTIME 换算、后段不改写前段报告通过。部分录制错误保留、拒绝覆盖已有 WAV、空段不能冒充成功通过。这里只使用合成输入，不是实际 MediaProjection 验收。
+- 原生合成设备/主机对照 passed：aligned/audio_early/audio_late、invalid_timing 拒绝与原文件保护、pending 发布失败清理；三段 H.264/AAC 解码通过，旋转保持，视频逐帧哈希相同，视频 PTS 最大误差 0µs。本次设备合成音 AAC 起声仍晚约 40ms，仅对照观察，未新增补偿，也未追加声光实验。
+- 测试媒体/截图/设备证据只在忽略目录 `.local/phase4a2/` 及 `.local/phase4a2-*.log/json`；合成 PCM 测试只删除本轮生成的 synthetic UUID 目录。首轮安装和两套 instrumentation 发起时间重叠，已按顺序复跑两套并确认报告，不采用交叠执行作为唯一依据。
+
+### 实际音乐模式与回归
+
+首版（页面离开即结束）已读取 5 段实际音乐 MP4，时长 2.374/7.231/2.533/2.699/2.833 秒，均 DONE、H.264 + AAC 48kHz 双声道，非零 PCM，ffmpeg 双轨完整解码通过。所有 JSON 帧数 = E-S = composition.sourceAudioFrames，主机按原始锚点重算 BOOTTIME 中位起点一致；后续片段/模式完成后再读取 5 个时间报告，字节未变。
+
+日志证明两个模式各连续两段；一个模式中间 gap 为 254976 帧（5.312 秒），另一个为 70656 帧（1.472 秒），均没有计入下一段 frames。首段报告离散度约 5µs，另一次短片有约 64ms 离散度，其余约 20–35µs；这是系统时间戳估计变化，保持记录、不新增同步补偿。用户反馈“保存成功，蓝牙音乐没中断”，回放/再次授权“没有问题”；初始将进入模式误认为开始录像，说明后已能操作。源码/日志尚未证明同模式连续三段，最终版本继续补 A/B/C。
+
+主动结束和切出页面在首版均记录 MUSIC_MODE_CLOSED；设备 dumpsys 确认本应用捕获服务与投影均不存在。用户反馈切出去选歌必须重新进入模式，进一步明确希望后台也继续视频与内录，本轮将此作为新增需求继续实施，并记 D020。
+
+### 最新范围：有明确通知的后台录像（D020）
+
+- 新 MusicCameraSession 用现有 LifecycleRegistry 实现服务持有的 CameraX 生命周期；仅音乐片段开始时迁移同一 Preview/VideoCapture，开始必须来自可见页面。
+- 服务在开始片段前提升为 mediaProjection|camera（camera 类型 API30+），主 Manifest 添加公开 FOREGROUND_SERVICE_CAMERA 与 camera 类型；无新增依赖、运行时权限类别、SDK/Gradle 升级。音乐模式在后台录像继续；预览初版断开/恢复，后按 D021 保留同一页面暂时切后台的连接，销毁才断开。每段 Finalize 后解绑服务相机并降回纯投影类型。
+- 通知明确区分音频捕获和摄像头+系统音频录制，含停止本段/结束模式；通知权限或频道不可见则禁止后台保留，后台每秒检查。锁屏、退出、撤权、任务移除和超时仍结束模式；不支持永久常驻、自动后台启动或进程强杀后续录。
+- 增加服务等待相机定稿的有界释放步骤（最多20秒）、陈旧通知动作的模式/片段ID检查、返回当前模式入口和服务拥有相机的预览恢复。音频时间戳只允许沿用获取后 1.5 秒内的附近锚点，无有效锚点时保留原带标记 fallback。
+- 本轮后台改动构建/Lint 通过（最新15秒，0 errors / 20 warnings）；曾增加一个 API29 的 camera 类型 InlinedApi 警告，补 API30 版本分支后消除。最新 APK 已安装并打开首页，设备 base.apk 与本机当前构建 SHA-256 一致；两套 debug 检查顺序复跑通过，最后 git diff --check 通过。用户已确认后台录像持续，但返回预览黑屏、最终视频有短暂停顿；修正与实际文件核对见下节。锁屏释放随后已观察；系统撤权与本版原独立功能回归仍待实际执行。
+- UIAutomator 在实时预览页面不能取得 idle，dump 未成功（“could not get idle state”）；改用应用日志、JSON、截图核对，不把未取得的 XML 当作 UI 成功证据。
+
+当前风险/待验证：公开 AudioRecord API 不提供每次 read 的精确起始帧，连续性保护只检测明显异常，不能证明任意小丢帧均可检测；长时功耗/热量和 10/30 分钟上限尚未跑完整设备测试，3 分钟空闲超时已实际观察；厂商纯音频系统主动撤权必须单独观察。Phase 3 约 100ms 局部同步偏差与周期配对歧义保持，不在本轮修复。
+
+### 2026-10-11：后台片段证据及返回页面的小修正
+
+用户确认切出应用摄像不会被打断，但返回预览黑屏、MP4 有短暂停顿；明确只允许小改动，较大调整后置。已按 D021 核对正式 1.6.2 源码，去掉音乐模式暂时 onPause 的 setSurfaceProvider(null)，同一页面 onResume 避免重复设置，真正 onDestroy 仍断开。仅 CameraActivity/MusicCameraSession 注释及文档变化，没有重写录像/合成/同步。
+
+原后台版实际读取同一模式的三段（另有更早片段，不把它们当新版复测）：
+
+| 段 UUID 前缀 | 视频时长 | 全局 PCM [S,E) / 帧数 | 非零样本 / 结果 |
+| --- | --- | --- | --- |
+| de2092e3 | 8.4746s | [5961728,6392832) / 431104 | 0；文件有效、音频全静音，不算有声捕获通过 |
+| 62a04cfe | 6.3497s | [7886848,8217600) / 330752 | 0；文件有效、音频全静音，不算有声捕获通过 |
+| 410f5843 | 13.0775s | [9916416,10566656) / 650240 | 782095；非静音，结束音乐模式时停止并合成成功 |
+
+三段同 musicModeId，无中途重新授权记录；全为 DONE/videoError=0、H.264 + AAC 48kHz立体声，ffmpeg 双轨完整解码通过；帧数=E-S=sourceAudioFrames，按原始全局锚点重算 BOOTTIME 起点一致。两个间隔分别 31.125333s、35.392s，未计入下一段。用户最新反馈明确后台视频持续及返回停顿，未明确各段音乐听感；有声音的单段不能替代三段全有声验收。第三段 stopReason 为“用户结束音乐模式”，不能记成通知停止本段已验证。
+
+另一个模式 ef62c779 短片 8.7513s、[64512,509952) / 445440 帧、全静音但双轨解码通过。日志在其 WAV 定稿后约180.606s 记录“空闲 3 分钟，音乐模式已结束”，随后 MUSIC_RESOURCES_RELEASED；主动结束的三段模式也已记录完整释放。当前 dumpsys services 为 nothing / media_projection 为 null。3分钟空闲释放已观察，不代表10/30分钟或长期功耗验收。
+
+实际命令：`adb -d exec-out run-as dev.musiccam.prototype cat files/phase1-events.log`；按 UUID 读取 session/audio-timing/composition JSON；`adb -d pull /sdcard/Movies/MusicCam/MusicCam-AV-<UUID>.mp4 <本地忽略目录>`；ffprobe -show_streams/-show_format；ffmpeg -v error -xerror 双轨解码；`python3 .local/phase4a2/audit_background.py`。证据仅在 `.local/phase4a2/background/`；首轮审计误要求所有 PCM 非零，遇到静音断言失败；去掉不成立的前提后逐段保留实际静音结果，未把静音改判成功。
+
+小修正版 `./gradlew --offline --no-daemon :app:assembleDebug :app:lintDebug` 18s 成功，0 errors / 20 warnings；`adb -d install -r` Success，首页冷启动 Status ok / 326ms。git diff --check 通过。已请求少量真机复测返回停顿、有实际播放音源的 A/B/C、通知停止和重新授权取消；尚未反馈的项目保持待验证。
+
+小修正版本轮已读取同一模式 A/B/C：5f3fde91（19.3366s，[1495040,2452480)，957440帧，1914809非零样本）、4922dc03（11.1233s，[2650112,3211264)，561152帧，1122263非零样本）、d5311438（5.7649s，[4661248,4963328)，302080帧，全静音）。均 DONE/error=0、H.264/AAC48k立体声，完整双轨解码；BOOTTIME换算和独立区间通过，间隔4.117333s/30.208s未写入下一段。A返回时新建页面（日志有新的 MainActivity/CameraActivity onCreate），preview=replaced；B/C同一页面返回为preview=reused。日志证明小修正生效，不替代画面是否改善和音乐内容的人工观察；C静音不能算三段全有声验收。证据 `.local/phase4a2/preview-fix/`。
+
+补充第四段 a57d1f77：同一模式12.3395s，[5791744,6409216)，617472帧、1234901非零样本；DONE/H.264+AAC、全段双轨解码通过。至此同一模式已确认三份非静音实际输出及一份静音输出，不把静音当有声结果；该额外段证据在 `.local/phase4a2/preview-extra/`，其后 dumpsys services=nothing / media_projection=null。听感、返回画面改善、通知停止本段、系统主动撤权和本版独立入口回归仍等待用户反馈。
+
+另有本轮锁屏操作：STOP_REQUEST“锁屏结束音乐模式”→MUSIC_MODE_CLOSED→MUSIC_RESOURCES_RELEASED（约136ms内）；此为应用锁屏处理，不冒充系统 MediaProjection.Callback.onStop 撤权验收。安装后 APK 签名验证通过，设备已安装 base.apk SHA-256 与构建相同。测试指引曾建议首页测试音再进入音乐页，但该入口 stopPlayback 会主动停止首页测试音，已当场补正为音乐 App 实际播放；未为测试改动原音源生命周期。
+
+### 2026-10-11 用户验收反馈与启动优化（10-13 补齐记录）
+
+- 用户明确“可以，解决了”“改善了”：D021 返回页面时的预览黑屏/MP4停顿已通过人工反馈；页面重建和其他厂商仍不作泛化保证。
+- d5311438 静音的实际原因由用户确认“我只是没开音乐”；记录为符合当时无音源情况，不判捕获失败，也不把它算有声捕获成功。
+- 通知“停止本段”用户确认能正常停止、日常优先级较低，不追加此交互改造。日志实际 e1c45e80 stopReason=通知栏停止本段，DONE/error=0，27.7515s，[87040,1446912) / 1359872帧，2719636非零样本；H.264/AAC48k立体声、完整双轨解码、区间/时间换算通过。后续退出模式完整释放；证据 `.local/phase4a2/notification-stop/`。
+- 独立录音用户确认正常：capture-1791704615070.wav，10.026667s、481280帧、PCM16/48k立体声、949939非零样本；允许测试音 ALL，路由type=8，tools/inspect_wav.py --expect non-silent通过，MediaPlayer回放完成。证据 `.local/phase4a2/regression/audio-inspection.json`。
+- 用户反馈独立摄像头切出会中断，属于原 Activity 生命周期的预期（D011），不是音乐模式后台录像回归。两段离开停止的实际文件 MusicCam-1791704650142-455be5a5.mp4 / MusicCam-1791704659604-a27e0288.mp4 分别1.899411s/2.032711s，Finalize error=0、单H.264、零音轨、完整解码通过；未擅自扩展独立录像为后台录像。
+- 原单段合成入口本版手动回归、系统主动 MediaProjection.Callback.onStop 撤权仍未取得确切结果；保留待验证，不把应用锁屏处理当系统撤权。取消授权历史音乐模式事件已存在，最新启动优化版本仍需回归。
+
+用户进一步报告点击开始先短暂黑屏，已按 D022 最小调整 CameraActivity/PlaybackCaptureService/MusicCameraSession：音乐页预览即使用已有自定义 owner，开始时服务接管同一个绑定，去掉按钮路径的解绑重绑。空闲页面 onPause 显式销毁自己的 owner，避免后台空闲相机；活动录像仍由服务持有。编码/合成、PCM、时间戳、同步补偿及独立模式行为未改。
+
+`./gradlew --offline --no-daemon :app:assembleDebug :app:lintDebug` 18s成功，Lint 0 errors / 20 warnings，日志 `.local/phase4a2-build-start-preview.log`；git diff --check通过。确认无活动服务后备份设备上一已验证APK至 `.local/phase4a2/preview-return-working.apk`，执行 `adb -d install -r app/build/outputs/apk/debug/app-debug.apk` 返回 INSTALL_FAILED_ABORTED / User rejected permissions。后续 am start -W 的 HOT/ok 只启动旧版本，不算新版本安装/体验验收。已请求用户解锁并允许手机安装确认，未绕过。
+
+2026-10-13继续：工作区保留以上修改，ADB重新检查为vivo V2527A的已授权device。当时启动小修仍等待安装准备回复及真机验证；不因设备连接或日期变化推定用户已允许手机安装，也不重复高成本声光测试。建议只录两小段确认开始无黑屏、同模式连续/后台返回不回归，并检查空闲切后台不继续摄像头。
+
+2026-10-13用户明确“可以安装了”：先检查USB设备已授权、dumpsys本应用服务为nothing，`adb -d install -r app/build/outputs/apk/debug/app-debug.apk` Success。`am start -W` WARM / Status ok / TotalTime41ms / WaitTime43ms；设备base.apk SHA-256与本机构建完全相同，`.local/phase4a2/start-preview-apk-state.json`。D022启动小修现已安装，尚不把安装/启动等同于黑屏消除；已请求仅两段短片确认空闲后台相机释放、开始黑屏、后台返回、同模式连续保存/音乐回放，无声光或通知重复测试。
+
+D022已安装版短片检查：a8315a0a（14.4622s，[119808,831488)，711680帧）和7d49875a（1.2663s，[290816,368640)，77824帧）分别在两个新模式录制，均DONE/videoError=0、H.264+AAC48k立体声、完整双轨解码，均全静音；不能由双轨文件判定有声捕获通过，也不把不同模式两段当同一授权连续两段。两个模式均有MUSIC_MODE_CLOSED/RESOURCES_RELEASED；另有空闲模式锁屏释放记录。
+
+另一个新模式的78d16d12：9.9303s，[163840,652288)，488448帧、976835非零样本；DONE/error=0，双轨完整解码与BOOTTIME换算通过。录制期间有MUSIC_UI_BACKGROUND→FOREGROUND preview=reused，开始记录binding=reused，支持相机交接和后台返回路径已运行；当时开始/返回视觉流畅和音乐听感仍等待人工反馈；随后用户确认问题解决并结束阶段，见顶部最终验收。证据仅在忽略目录start-preview/、start-preview-first/、start-preview-background/。未新增声光实验或修改同步补偿。
 
 ## Phase 4A：MediaProjection 授权体验优化（已完成，连续拍摄仅分析）
 

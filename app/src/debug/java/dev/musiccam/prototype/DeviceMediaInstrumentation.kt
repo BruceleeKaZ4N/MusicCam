@@ -11,8 +11,21 @@ import java.security.MessageDigest
 
 /** Framework instrumentation needs no test framework/library or MediaProjection permission. */
 class DeviceMediaInstrumentation : Instrumentation() {
-    override fun onCreate(arguments: Bundle?) { super.onCreate(arguments); start() }
+    private var musicOnly = false
+    override fun onCreate(arguments: Bundle?) {
+        super.onCreate(arguments)
+        musicOnly = arguments?.getString("suite") == "music_pcm"
+        start()
+    }
     override fun onStart() {
+        if (musicOnly) {
+            val result = try { MusicPcmCheck.run(targetContext) }
+            catch (e: Exception) { JSONObject().put("passed", false).put("error", e.toString()) }
+            SessionStorage.writeJson(File(targetContext.filesDir, "music-pcm-check.json"), result)
+            finish(if (result.getBoolean("passed")) -1 else 1,
+                Bundle().apply { putString("stream", result.toString(2)) })
+            return
+        }
         val reports = JSONArray()
         var failed = false
         val root = File(targetContext.filesDir, "native-checks")

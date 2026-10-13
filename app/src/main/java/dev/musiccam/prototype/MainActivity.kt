@@ -58,11 +58,23 @@ class MainActivity : Activity() {
             setPadding(spacing, spacing, spacing, spacing)
         }
         content.addView(TextView(this).apply { setText(R.string.phase_one_intro); textSize = 18f })
+        button(content, R.string.open_music_mode) {
+            if (PlaybackCaptureService.status.active || PlaybackCaptureService.mode.stopping ||
+                (CombinedSessionController.active != null && !PlaybackCaptureService.mode.active)) return@button
+            stopPlayback()
+            startActivity(Intent(this, CameraActivity::class.java).putExtra(CameraActivity.EXTRA_MUSIC_MODE, true))
+        }
         button(content, R.string.open_combined) {
+            if (PlaybackCaptureService.mode.active || PlaybackCaptureService.mode.stopping) {
+                localMessage = "请先结束当前音乐模式"; render(); return@button
+            }
             stopPlayback()
             startActivity(Intent(this, CameraActivity::class.java).putExtra(CameraActivity.EXTRA_COMBINED, true))
         }
         button(content, R.string.open_camera) {
+            if (PlaybackCaptureService.mode.active || PlaybackCaptureService.mode.stopping) {
+                localMessage = "请先结束当前音乐模式"; render(); return@button
+            }
             startActivity(Intent(this, CameraActivity::class.java))
         }
         startButton = button(content, R.string.start_recording) { begin() }
@@ -107,7 +119,8 @@ class MainActivity : Activity() {
         Button(this).apply { setText(label); setOnClickListener { action() }; parent.addView(this) }
 
     private fun begin() {
-        if (pending || startingService || PlaybackCaptureService.status.active || CombinedSessionController.active != null) return
+        if (pending || startingService || PlaybackCaptureService.status.active || PlaybackCaptureService.mode.active ||
+            PlaybackCaptureService.mode.stopping || CombinedSessionController.active != null) return
         stopReplay()
         pending = true
         localMessage = null
@@ -191,13 +204,16 @@ class MainActivity : Activity() {
         if (state !== lastCaptureStatus && !state.active && lastCaptureStatus.active) localMessage = null
         lastCaptureStatus = state
         if (startingService && state !== beforeStart) startingService = false
-        val busy = state.active || pending || startingService
+        val busy = state.active || pending || startingService || PlaybackCaptureService.mode.active ||
+            PlaybackCaptureService.mode.stopping || CombinedSessionController.active != null
         startButton.isEnabled = !busy
         stopButton.isEnabled = state.active && !state.stopping
         replayButton.isEnabled = !busy && currentFile() != null
         val previous = getSharedPreferences("capture", MODE_PRIVATE).getString("message", null)
         val interrupted = File(filesDir, "recordings").listFiles()?.any { it.name.endsWith(".part") } == true
         statusView.text = when {
+            PlaybackCaptureService.mode.active -> PlaybackCaptureService.mode.message + "\n点击音乐模式入口返回，或从通知结束模式。"
+            PlaybackCaptureService.mode.stopping -> PlaybackCaptureService.mode.message
             state.active -> state.message
             startingService -> getString(R.string.starting_service)
             pending -> localMessage ?: getString(R.string.waiting_projection)

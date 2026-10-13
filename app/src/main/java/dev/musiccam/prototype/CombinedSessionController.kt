@@ -30,12 +30,25 @@ class CombinedSessionController private constructor(private val context: Applica
 
         fun start(context: Context, video: VideoCapture<Recorder>, consent: Intent,
                   buttonNs: Long, authorization: JSONObject, configuration: String): CombinedSessionController {
-            check(active == null && !PlaybackCaptureService.status.active) { "已有录制会话，请先停止" }
+            check(active == null && !PlaybackCaptureService.status.active && !PlaybackCaptureService.mode.active &&
+                !PlaybackCaptureService.mode.stopping) { "已有录制会话，请先停止" }
             val controller = CombinedSessionController(context.applicationContext as Application, UUID.randomUUID().toString(),
                 JSONObject().put("buttonClickNs", buttonNs).put("authorization", authorization)
                     .put("configuration", configuration).put("clock", "elapsedRealtimeNanos/TIMEBASE_BOOTTIME"))
             active = controller
             controller.begin(video, consent)
+            return controller
+        }
+
+        fun startMusicClip(context: Context, video: VideoCapture<Recorder>, modeId: String,
+                           buttonNs: Long, configuration: String): CombinedSessionController {
+            val mode = PlaybackCaptureService.mode
+            check(active == null && mode.id == modeId && mode.ready && !mode.stopping) { "音乐模式未就绪或上一片段正在处理" }
+            val controller = CombinedSessionController(context.applicationContext as Application, UUID.randomUUID().toString(),
+                JSONObject().put("musicModeId", modeId).put("buttonClickNs", buttonNs)
+                    .put("configuration", configuration).put("clock", "elapsedRealtimeNanos/TIMEBASE_BOOTTIME"))
+            active = controller
+            controller.beginMusic(video)
             return controller
         }
 
@@ -70,6 +83,8 @@ class CombinedSessionController private constructor(private val context: Applica
     private var journalFailed = false
     private var postProcessingStarted = false
     private var audioLaunchAccepted = false
+    private val musicModeId = journal.optString("musicModeId").takeIf { it.isNotEmpty() }
+    private var waitingVideo: VideoCapture<Recorder>? = null
     var listener: (() -> Unit)? = null
     var state = State.PREPARING
         private set
@@ -82,7 +97,30 @@ class CombinedSessionController private constructor(private val context: Applica
         override fun run() {
             if (!capturing) return
             val audio = PlaybackCaptureService.status
-            if (audio.sessionId == id) {
+            if (musicModeId != null) {
+                val mode = PlaybackCaptureService.mode
+                val pcm = PlaybackCaptureService.clip
+                if (pcm?.id == id && pcm.modeId == musicModeId) {
+                    seenAudio = pcm.opened
+                    audioStarted = pcm.opened
+                    if (pcm.finalized) {
+                        audioDone = true
+                        audioNonZero = pcm.nonZeroSamples
+                        journal.put("startFrameInclusive", pcm.startFrame).put("endFrameExclusive", pcm.endFrame)
+                        pcm.error?.let { if ("音频：$it" !in failures) failures.add("音频：$it") }
+                        if (state != State.STOPPING) stop("音频片段已结束")
+                    } else if (pcm.opened && canStop && waitingVideo != null) {
+                        val video = waitingVideo!!
+                        waitingVideo = null
+                        try { startVideo(video); saveOrThrow() }
+                        catch (e: Exception) {
+                            if (recording == null) videoDone = true
+                            abort("视频启动失败：${describe(e)}")
+                        }
+                    }
+                }
+                if (mode.id != musicModeId || !mode.active || mode.stopping) musicModeEnded(musicModeId, mode.message)
+            } else if (audio.sessionId == id) {
                 seenAudio = true
                 audioStarted = audio.recordingStartedNs > 0
                 if (!audio.active) {
@@ -94,18 +132,27 @@ class CombinedSessionController private constructor(private val context: Applica
             }
             if (state == State.PREPARING && audioStarted && videoStarted) transition(State.RECORDING, "正在录制视频和系统播放音频；停止后自动合成。")
             val now = SystemClock.elapsedRealtimeNanos()
+            if (musicModeId != null && state == State.RECORDING && now - createdNs >= 600_000_000_000L)
+                stop("本段达到 10 分钟上限")
             if (state == State.PREPARING && now - createdNs > 10_000_000_000L) {
                 failures.add("10 秒内未能启动两路录制")
                 stop("启动超时")
+                if (musicModeId != null) PlaybackCaptureService.endMusicMode("片段启动超时", musicModeId)
             }
             if (state == State.STOPPING && now - stopNs > 20_000_000_000L) {
-                if (!seenAudio) { failures.add("音频服务未确认启动，原始数据保留"); audioDone = true }
+                if (musicModeId != null && !audioDone) PlaybackCaptureService.endMusicMode("片段定稿超时", musicModeId)
+                if (!seenAudio && musicModeId == null) { failures.add("音频服务未确认启动，原始数据保留"); audioDone = true }
                 if (!videoDone) {
                     failures.add("视频尚未确认定稿，保留原始文件")
+                    if (musicModeId != null) PlaybackCaptureService.endMusicMode("视频定稿超时", musicModeId)
                     recording?.close()
                     recording = null
                     videoDone = true
                 }
+            }
+            if (musicModeId != null && state == State.STOPPING && now - stopNs > 30_000_000_000L && !audioDone) {
+                failAndPreserve("音频片段未确认定稿；保留文件，禁止继续本授权会话")
+                return
             }
             join()
             if (capturing) { listener?.invoke(); main.postDelayed(this, 100) }
@@ -124,13 +171,7 @@ class CombinedSessionController private constructor(private val context: Applica
                 .setAction(PlaybackCaptureService.ACTION_START).putExtra(PlaybackCaptureService.EXTRA_SESSION_ID, id)
                 .putExtra(PlaybackCaptureService.EXTRA_CONSENT, consent))
             audioLaunchAccepted = true
-            journal.put("videoRequestNs", SystemClock.elapsedRealtimeNanos())
-            // Receive the event on Recorder's executor first; stamp before posting to the UI thread.
-            recording = video.output.prepareRecording(context, FileOutputOptions.Builder(File(directory, "video.mp4")).build())
-                .start(Executor { command -> command.run() }) { event ->
-                    val received = SystemClock.elapsedRealtimeNanos()
-                    main.post { videoEvent(event, received) }
-                }
+            startVideo(video)
             saveOrThrow()
             PocLog.event(context, "PHASE3_BEGIN id=$id buttonNs=${journal.getLong("buttonClickNs")} videoRequestNs=${journal.getLong("videoRequestNs")}")
         } catch (e: Exception) {
@@ -139,6 +180,41 @@ class CombinedSessionController private constructor(private val context: Applica
             if (!audioLaunchAccepted) audioDone = true
             stop("启动失败")
         } finally { main.post(poll) }
+    }
+
+    private fun beginMusic(video: VideoCapture<Recorder>) {
+        journal.put("id", id).put("state", state.name).put("createdNs", createdNs)
+        preferences.edit().putString("recoverableId", id).apply()
+        try {
+            check(context.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED &&
+                context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "录制权限已撤回" }
+            saveOrThrow()
+            waitingVideo = video
+            PlaybackCaptureService.openMusicClip(musicModeId!!, id)
+            audioLaunchAccepted = true
+            PocLog.event(context, "MUSIC_CLIP_REQUEST mode=$musicModeId id=$id")
+        } catch (e: Exception) {
+            failures.add("片段启动失败：${describe(e)}")
+            videoDone = true
+            audioDone = !audioLaunchAccepted
+            stop("片段启动失败")
+            PlaybackCaptureService.endMusicMode("片段启动失败", musicModeId)
+        } finally { main.post(poll) }
+    }
+
+    private fun startVideo(video: VideoCapture<Recorder>) {
+        journal.put("videoRequestNs", SystemClock.elapsedRealtimeNanos())
+        // Timestamp CameraX receipts exactly as Phase 3; no change to composition/alignment.
+        recording = video.output.prepareRecording(context, FileOutputOptions.Builder(File(directory, "video.mp4")).build())
+            .start(Executor { command -> command.run() }) { event ->
+                val received = SystemClock.elapsedRealtimeNanos()
+                main.post { videoEvent(event, received) }
+            }
+    }
+
+    fun musicModeEnded(modeId: String, reason: String) {
+        if (musicModeId != modeId || !capturing) return
+        stop(reason)
     }
 
     private fun videoEvent(event: VideoRecordEvent, receivedNs: Long) {
@@ -173,6 +249,11 @@ class CombinedSessionController private constructor(private val context: Applica
                 journal.put("videoFinalizeReceivedNs", receivedNs).put("videoError", event.error)
                     .put("videoFinalDurationNs", event.recordingStats.recordedDurationNanos)
                 if (event.hasError()) failures.add("CameraX 定稿错误 ${event.error}：${event.cause?.javaClass?.simpleName ?: "无异常详情"}")
+                if (musicModeId != null) {
+                    PlaybackCaptureService.releaseMusicCamera(musicModeId)
+                    PlaybackCaptureService.closeMusicClip(musicModeId, id)
+                    if (event.hasError()) PlaybackCaptureService.endMusicMode("摄像头录制异常", musicModeId)
+                }
                 if (state != State.STOPPING) stop("视频会话结束")
                 saveSafely()
                 join()
@@ -185,20 +266,30 @@ class CombinedSessionController private constructor(private val context: Applica
         stopNs = SystemClock.elapsedRealtimeNanos()
         journal.put("stopRequestNs", stopNs).put("stopReason", reason)
         transition(State.STOPPING, "$reason；正在停止两路录制并保存中间文件…")
-        PlaybackCaptureService.stop(reason, id)
-        try { recording?.stop() } catch (e: Exception) { failures.add("视频停止：${describe(e)}") }
+        if (musicModeId == null) PlaybackCaptureService.stop(reason, id)
+        else if (recording == null) {
+            waitingVideo = null
+            videoDone = true
+            PlaybackCaptureService.closeMusicClip(musicModeId, id)
+        }
+        try { recording?.stop() } catch (e: Exception) {
+            failures.add("视频停止：${describe(e)}")
+            if (musicModeId != null) PlaybackCaptureService.endMusicMode("视频停止失败", musicModeId)
+        }
         saveSafely()
         PocLog.event(context, "PHASE3_STOP id=$id ns=$stopNs reason=$reason")
     }
 
     fun abort(reason: String) {
-        if (!canStop) return
+        if (!capturing) return
         failures.add(reason)
         stop(reason)
+        if (musicModeId != null) PlaybackCaptureService.endMusicMode(reason, musicModeId)
     }
 
     private fun join() {
         if (postProcessingStarted || state != State.STOPPING || !videoDone || !audioDone) return
+        if (musicModeId != null) PlaybackCaptureService.releaseMusicCamera(musicModeId)
         postProcessingStarted = true
         main.removeCallbacks(poll)
         journal.put("videoFinalized", journal.has("videoFinalizeReceivedNs"))
